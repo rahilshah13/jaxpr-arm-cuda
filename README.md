@@ -1,6 +1,6 @@
-# JAXPR AOT Compiler & Runtime
+### JAXPR AOT Compiler & Runtime
 
-A pipeline lowering JAX expressions (`jaxpr`) to ARM64 NEON and NVIDIA CUDA, bypassing XLA for bare-metal execution.
+Lower JAX expressions (`jaxpr`) to ARM64 NEON and NVIDIA CUDA.
 
 ---
 
