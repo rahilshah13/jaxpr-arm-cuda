@@ -1,13 +1,13 @@
-### JAXPR AOT Compiler & Runtime
+### JAXPR Compiler
 
-Lower JAX expressions (`jaxpr`) to ARM64 NEON and NVIDIA CUDA.
+Lower JAX expressions (`jaxpr`) to ARM64 NEON and CUDA.
 
 ---
 
 *   **ARM64 Backend:** Liveness-based allocation (`v8`-`v31`); float loading via `movz`/`movk`; 128-bit vector loops.
 *   **CUDA Backend:** Maps array dimensions to SIMT threads; generates C++ operations with managed host-device copies.
 *   **Runtime:** Spawns POSIX threads executing CPU and GPU streams concurrently.
-*   **AWS Instance:** `g6g.xlarge` (or larger)
+*   **AWS Instance:** `g6g.xlarge`
 
 ### Dependencies
 ```bash
