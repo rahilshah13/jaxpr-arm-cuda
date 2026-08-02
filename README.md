@@ -17,7 +17,7 @@
 
 ---
 
-The deterministic DDIM sampling update step implemented in `generate_audio_ddim` computes the estimated clean data point $\hat{x}_0$ and steps backward to the previous latent state $x_{t-1}$ via:
+The deterministic DDIM sampling update step implemented in `generate_audio_ddim` computes the estimated clean data point and steps backward to the previous latent state via:
 
 $$\hat{x}_0 = \frac{x_t - \sigma_t \epsilon_\theta(x_t, t)}{\alpha_t}$$
 
