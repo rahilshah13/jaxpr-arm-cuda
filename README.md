@@ -6,14 +6,14 @@
 
 ---
 
-#### Terminology Key
+#### Terminology
 
-* **AOT (Ahead-Of-Time):** Compilation phase that lowers high-level graph expressions (jaxprs) directly into native hardware assembly prior to runtime execution.
-* **NEON:** ARM's advanced SIMD (Single Instruction, Multiple Data) architecture extension enabling parallel floating-point vector processing.
-* **DDIM (Denoising Diffusion Implicit Models):** A non-Markovian deterministic sampling formulation that accelerates diffusion model generation by skipping steps.
-* **CFG (Classifier-Free Guidance):** A conditioning technique that blends conditional and unconditional noise predictions to enhance sample alignment and generation quality.
+* **AOT (Ahead-Of-Time):** Compilation phase that lowers high-level jaxprs into native hardware assembly.
+* **NEON:** ARM's SIMD (Single Instruction, Multiple Data) architecture extension.
+* **DDIM (Denoising Diffusion Implicit Models):** A non-Markovian deterministic sampling formulation.
+* **CFG (Classifier-Free Guidance):** A conditioning technique that blends conditional and unconditional noise predictions 
 * **RoPE (Rotary Position Embedding):** A positional encoding method that multiplies the representation by a rotation matrix dependent on absolute token positions.
-* **EMA (Exponential Moving Average):** A weight-smoothing technique applied over training updates to stabilize model convergence and improve inference performance.
+* **EMA (Exponential Moving Average):** A weight-smoothing technique applied over training updates to stabilize model convergence.
 
 ---
 
@@ -35,16 +35,15 @@ Where:
 
 ### CLI Execution Modes
 
-* **Native JAX Backend Execution**: Run the script without compilation flags to execute all operations (transformer layers, attention mechanisms, and gradient updates) entirely through the native JAX/XLA runtime:
-```bash
-python script.py
-
-```
-
-* **AOT Validation**: Run `python script.py --aot` to compile and test the custom ARM64 NEON vector backend against native JAX outputs.
-* **Audio Generation**: Run `python script.py --sample` to generate a target audio sequence using EMA weights and save the output matrix.
-* **Dependencies Installation**: Run the following command to install all required Python package dependencies for the runtime engine:
 ```bash
 pip install jax jaxlib optax numpy
 
+# native JAX Backend 
+python3 model.py
+
+# arm64 neon 
+python3 model.py --aot
+
+# audio generation
+python3 model.py --sample
 ```
