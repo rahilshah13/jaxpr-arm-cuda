@@ -3,8 +3,6 @@
 * **ARM64 NEON AOT Compiler (`AppleSiliconNeonRuntime`)**: Translates JAX elementwise jaxprs into optimized ARM64 assembly, dynamically compiles via `clang` into a shared library (`libarm.dylib`), and executes via `ctypes` with strict memory alignment guards.
 * **Diffusion Transformer Core (`gpt_forward`)**: Implements a transformer block utilizing RMSNorm, Rotary Position Embeddings (RoPE), scaled dot-product attention, Frobenius weight norm clamping, and STFT loss for generative modeling.
 * **JAX-Native DDIM Sampler (`generate_audio_ddim`)**: Executes fast denoising loops using `jax.lax.scan` supporting classifier-free guidance (CFG).
-* **Optimized Data Loader (`BoundedMMapPool`)**: Manages bounded LRU memory-mapped file pools, JSONL metadata caching, and a background multi-threaded prefetching queue (`PrefetchDataLoader`).
-* **Atomic Checkpointing & Gradient Sync**: Implements robust file locking (`fcntl`) to coordinate distributed gradient aggregation, version verification, and atomic checkpoint rotation.
 
 ---
 
@@ -18,8 +16,6 @@
 * **EMA (Exponential Moving Average):** A weight-smoothing technique applied over training updates to stabilize model convergence and improve inference performance.
 
 ---
-
-### Model Equation
 
 The deterministic DDIM sampling update step implemented in `generate_audio_ddim` computes the estimated clean data point $\hat{x}_0$ and steps backward to the previous latent state $x_{t-1}$ via:
 
@@ -44,7 +40,6 @@ Where:
 python script.py
 
 ```
-
 
 * **AOT Validation**: Run `python script.py --aot` to compile and test the custom ARM64 NEON vector backend against native JAX outputs.
 * **Audio Generation**: Run `python script.py --sample` to generate a target audio sequence using EMA weights and save the output matrix.
