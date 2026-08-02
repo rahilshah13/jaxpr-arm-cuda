@@ -1,8 +1,4 @@
-## Audio Diffusion in JAX with an experimental Apple Arm64 Vectorized Backend
-
-A high-performance Python engine combining custom ahead-of-time (AOT) ARM64 NEON vector compilation, a diffusion transformer architecture for audio generation, an optimized memory-mapped data loader, and atomic multi-process checkpoint synchronization.
-
-### Key Components
+#### Audio Diffusion in JAX with an experimental Apple Arm64 Vectorized Backend
 
 * **ARM64 NEON AOT Compiler (`AppleSiliconNeonRuntime`)**: Translates JAX elementwise jaxprs into optimized ARM64 assembly, dynamically compiles via `clang` into a shared library (`libarm.dylib`), and executes via `ctypes` with strict memory alignment guards.
 * **Diffusion Transformer Core (`gpt_forward`)**: Implements a transformer block utilizing RMSNorm, Rotary Position Embeddings (RoPE), scaled dot-product attention, Frobenius weight norm clamping, and STFT loss for generative modeling.
@@ -12,7 +8,7 @@ A high-performance Python engine combining custom ahead-of-time (AOT) ARM64 NEON
 
 ---
 
-### Terminology Key
+#### Terminology Key
 
 * **AOT (Ahead-Of-Time):** Compilation phase that lowers high-level graph expressions (jaxprs) directly into native hardware assembly prior to runtime execution.
 * **NEON:** ARM's advanced SIMD (Single Instruction, Multiple Data) architecture extension enabling parallel floating-point vector processing.
