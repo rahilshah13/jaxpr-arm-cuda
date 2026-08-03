@@ -1,4 +1,4 @@
-#### Audio Diffusion in JAX with an experimental Apple Arm64 Vectorized Backend
+#### Audio Diffusion in JAX + an experimental Apple Arm64 Vectorized Backend
 
 * **ARM64 NEON AOT Compiler (`AppleSiliconNeonRuntime`)**: Compiles JAX jaxprs into optimized ARM64 assembly via `clang` and executes through `ctypes`.
 * **Diffusion Transformer Core (`gpt_forward`)**: Implements transformer blocks using RMSNorm, RoPE, attention, weight norm clamping, and STFT loss.
@@ -6,18 +6,7 @@
 
 ---
 
-#### Terminology
-
-* **AOT (Ahead-Of-Time):** Compiles high-level jaxprs into native hardware assembly.
-* **NEON:** ARM's SIMD (Single Instruction, Multiple Data) architecture extension.
-* **DDIM (Denoising Diffusion Implicit Models):** A non-Markovian deterministic sampling formulation.
-* **CFG (Classifier-Free Guidance):** Blends conditional and unconditional noise predictions.
-* **RoPE (Rotary Position Embedding):** Encodes positions by rotating representations based on absolute token indices.
-* **EMA (Exponential Moving Average):** Smooths weights across training updates to stabilize convergence.
-
----
-
-The deterministic DDIM sampling update step implemented in `generate_audio_ddim` computes the estimated clean data point and steps backward to the previous latent state via:
+The DDIM sampling update step implemented in `generate_audio_ddim` computes the estimated clean data point and steps backward to the previous latent state via:
 
 $$\hat{x}_0 = \frac{x_t - \sigma_t \epsilon_\theta(x_t, t)}{\alpha_t}$$
 
@@ -32,8 +21,6 @@ Where:
 * $z \sim \mathcal{N}(0, I)$: Standard Gaussian noise.
 
 ---
-
-### CLI Execution Modes
 
 ```bash
 pip install jax jaxlib optax numpy
