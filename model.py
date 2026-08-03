@@ -1,22 +1,8 @@
-import os
-import json
-import pickle
-import queue
-import threading
-import time
-import sys
-import numpy as np
-import struct
-import subprocess
-import ctypes
-import fcntl
-import shutil
+import os, json, pickle, queue, threading, time, sys, struct, subprocess, ctypes, fcntl, shutil, optax, jax
+import numpy as np, jax.numpy as jnp
+from jax.core import Literal
 from functools import partial
 
-import jax
-import jax.numpy as jnp
-from jax.core import Literal
-import optax
 
 # Target Apple Silicon / Metal performance settings
 jax.config.update("jax_default_matmul_precision", "float32")
