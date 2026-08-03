@@ -1,8 +1,8 @@
 #### Audio Diffusion in JAX + an experimental Apple Arm64 Vectorized Backend
 
-* **ARM64 NEON AOT Compiler (`AppleSiliconNeonRuntime`)**: Compiles JAX jaxprs into optimized ARM64 assembly via `clang` and executes through `ctypes`.
+* **`AppleSiliconNeonRuntime`**: Compiles JAX jaxprs into ARM64 assembly via `clang` and executes through `ctypes`.
 * **Diffusion Transformer Core (`gpt_forward`)**: Implements transformer blocks using RMSNorm, RoPE, attention, weight norm clamping, and STFT loss.
-* **JAX-Native DDIM Sampler (`generate_audio_ddim`)**: Runs fast denoising loops via `jax.lax.scan` with classifier-free guidance (CFG).
+* **`generate_audio_ddim`**: Runs fast denoising loops via `jax.lax.scan` with classifier-free guidance (CFG).
 
 ---
 
@@ -12,7 +12,6 @@ $$\hat{x}_0 = \frac{x_t - \sigma_t \epsilon_\theta(x_t, t)}{\alpha_t}$$
 
 $$x_{t-1} = \alpha_{t-1} \hat{x}_0 + \sqrt{1 - \alpha_{t-1}^2 - \sigma_h^2} \, \epsilon_\theta(x_t, t) + \sigma_h z$$
 
-Where:
 
 * $x_t$: Noisy latent tensor at diffusion step $t$.
 * $\epsilon_\theta(x_t, t)$: Predicted noise vector from the transformer backbone.
@@ -33,5 +32,4 @@ python3 model.py --aot
 
 # audio generation
 python3 model.py --sample
-
 ```
