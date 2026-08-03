@@ -57,13 +57,13 @@ def compile_elementwise_jaxpr_to_neon(closed_jaxpr):
     if len(jaxpr.invars) > 6:
         raise NotImplementedError("Only up to 6 inputs supported under AAPCS64 register bounds.")
 
-    literals = {}
-    for eqn in jaxpr.eqns:
-        for invar in eqn.invars:
-            if isinstance(invar, Literal):
-                val = literal_key(invar.val)
-                if val not in literals:
-                    literals[val] = None
+    literals = {
+      literal_key(invar.val): None
+      for eqn in jaxpr.eqns
+      for invar in eqn.invars
+      if isinstance(invar, Literal)
+    }
+
 
     if len(literals) > 15:
         raise RuntimeError("Exceeded maximum limit of 15 vector registers for literal constants (v31 reserved for scratch).")
