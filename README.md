@@ -1,12 +1,12 @@
-#### Audio Diffusion in JAX + an experimental Apple Arm64 Vectorized Backend
+#### Audio Diffusion in JAX + an experimental Arm64 Neon Backend
 
 * **`AppleSiliconNeonRuntime`**: Compiles JAX jaxprs into ARM64 assembly via `clang` and executes through `ctypes`.
-* **Diffusion Transformer Core (`gpt_forward`)**: Implements transformer blocks using RMSNorm, RoPE, attention, weight norm clamping, and STFT loss.
+* **`gpt_forward`**: diffusion transformer blocks using RMSNorm, RoPE, attention, weight norm clamping, and STFT loss.
 * **`generate_audio_ddim`**: Runs fast denoising loops via `jax.lax.scan` with classifier-free guidance (CFG).
 
 ---
 
-The DDIM sampling update step implemented in `generate_audio_ddim` computes the estimated clean data point and steps backward to the previous latent state via:
+The sampling update step `generate_audio_ddim` estimates the clean data point and steps backward to the previous latent state via:
 
 $$\hat{x}_0 = \frac{x_t - \sigma_t \epsilon_\theta(x_t, t)}{\alpha_t}$$
 
