@@ -51,7 +51,7 @@ def export_jaxpr_to_json(closed_jaxpr, filepath="jaxpr.json"):
 
 def run_go_validator(data_x, data_y):
     result = subprocess.run(
-        ["go", "run", "validator.go"],
+        ["go", "run", "jaxpr_compiler.go"],
         input=f"{data_x.size}\n" + " ".join(map(str, data_x.flatten())) + "\n" + " ".join(map(str, data_y.flatten())) + "\n",
         text=True,
         capture_output=True,
