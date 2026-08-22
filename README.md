@@ -1,4 +1,6 @@
-#### audio diffusion in JAX
+#### generative audio transformer in JAX
+
+- continuation of work from `https://github.com/rahilshah13/audio`
 
 ---
 
