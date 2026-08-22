@@ -1,0 +1,15 @@
+__pycache__/
+.DS_Store
+*.py[cod]
+*$py.class
+*.dylib
+*.so
+*.dll
+*.o
+*.cu
+*.s
+.venv/
+checkpoints/
+output/
+data/*
+!data/urls.txt
