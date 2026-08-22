@@ -1,8 +1,6 @@
-# JAX-based Parallel Audio Diffusion Architecture on ARM64 & CUDA
-
-Compiles JAX expressions into ARM64 NEON assembly and NVIDIA CUDA C binaries for concurrent execution, supporting multi-channel stems and discrete audio conditioning features.
-
 #### audio diffusion in JAX
+
+---
 
 $$ \mathcal{L}_{\text{total}} = \min_{\theta} \mathbb{E}_{t, \mathbf{X}_0, \boldsymbol{\epsilon}, \mathbf{c}} \left[ \left\| \epsilon_\theta \left( \boldsymbol{\alpha}_t \odot \mathbf{X}_0 + \boldsymbol{\sigma}_t \odot \boldsymbol{\epsilon}, t, \mathbf{c} \right) - \boldsymbol{\epsilon} \right\|^2 + \lambda \left( \left\| \text{STFT}(\mathbf{X}_0) - \text{STFT}(\hat{\mathbf{X}}_0) \right\|_1 + \left\| \mathbf{X}_0 - \hat{\mathbf{X}}_0 \right\|_1 \right) \right] $$
 
