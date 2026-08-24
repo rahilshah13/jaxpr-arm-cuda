@@ -54,6 +54,10 @@ def compute_empirical_ntk(params, batch_x, scales, bpms, stems, steps, sigmas, m
 def gpt_forward(params, x, cond, mask=None, target_dim=44100, patch_dim=441, num_patches=100, n_heads=16):
     scale, bpm, stem, step_indices, sigma_t = cond
     B, T, L = x.shape
+    
+    # Apply input RMS normalization to incoming batch_x for scale invariance across different tracks
+    x = rms_norm(x, params['input_rms_scale'])
+    
     encoded = jax.nn.gelu(x.reshape(B, T, num_patches, patch_dim) @ params['audio_encoder']) @ params['down_proj_2']
     C, bt = encoded.shape[-1], B * T
     head_dim = C // n_heads
@@ -85,7 +89,7 @@ def gpt_forward(params, x, cond, mask=None, target_dim=44100, patch_dim=441, num
 xavier_normal = lambda key, shape: jax.random.normal(key, shape) * jnp.sqrt(2.0 / (shape[-2] if len(shape) >= 2 else shape[0] + shape[-1] if len(shape) >= 2 else shape[0]))
 
 def init_params(key, dim=1024, patch_dim=441, comp_dim=512, steps=50):
-    keys = jax.random.split(key, 21)
+    keys = jax.random.split(key, 22)
     return {
         'audio_encoder': xavier_normal(keys[0], (patch_dim, comp_dim)), 'down_proj_2': xavier_normal(keys[1], (comp_dim, dim)),
         'query': jax.random.orthogonal(keys[2], dim), 'key': jax.random.orthogonal(keys[3], dim), 'value': jax.random.orthogonal(keys[4], dim),
@@ -93,6 +97,7 @@ def init_params(key, dim=1024, patch_dim=441, comp_dim=512, steps=50):
         'ff_1': xavier_normal(keys[8], (dim, dim * 4)), 'ff_2': xavier_normal(keys[9], (dim * 4, dim)),
         'up_proj_1': xavier_normal(keys[10], (dim, comp_dim)), 'up_proj_2': xavier_normal(keys[11], (comp_dim, comp_dim)), 'out_proj': xavier_normal(keys[19], (comp_dim, patch_dim)),
         'rms_scale_1': jnp.ones((dim,)), 'rms_scale_2': jnp.ones((dim,)), 't_rms_scale': jnp.ones((dim,)), 'out_rms_scale': jnp.ones((comp_dim,)),
+        'input_rms_scale': jnp.ones((1,)),
         'scale_emb': xavier_normal(keys[12], (128, dim)), 'bpm_proj': xavier_normal(keys[13], (1, dim)), 'stem_emb': xavier_normal(keys[14], (2, dim)),
         'time_emb': xavier_normal(keys[15], (steps, dim)), 't_pos_emb': xavier_normal(keys[16], (512, dim)), 'sigma_emb': xavier_normal(keys[18], (dim,))
     }
