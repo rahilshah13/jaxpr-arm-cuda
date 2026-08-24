@@ -53,3 +53,23 @@ python3 processing.py
 python3 model.py
 python3 inference.py --compile --seconds 10
 python3 inference.py --generate --seconds 10
+English.
+```
+---
+
+#### `model2.py`
+
+
+$$\theta_{t+1}^{(M)} = (1 - \eta)\left(\theta_t^{(M)} - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t^{(M)})\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
+
+### Symbol Key
+
+* $\theta_t^{(M)}$: The parameter state of the master model at global step $t$.
+* $\eta$: The global parameter reconciliation blending weight (allocated across the concurrent single-track models).
+* $\alpha$: The optimizer learning rate for the master model.
+* $\mathcal{L}_{\text{window}}$: The combined audio loss evaluated on randomly sampled short audio windows.
+* $K$: The total number of concurrent single-track models ($CONCURRENT\_MODELS$).
+* $w_k$: The normalized proportional weight assigned to the $k$-th single-track model ($w_k = \frac{1}{K}$).
+* $\theta_{k, \text{conv}}$: The fully converged parameter state of the $k$-th concurrent model trained to zero loss on a full audio track.
+
+
