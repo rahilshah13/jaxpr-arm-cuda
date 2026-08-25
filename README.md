@@ -53,7 +53,6 @@ python3 processing.py
 python3 model.py
 python3 inference.py --compile --seconds 10
 python3 inference.py --generate --seconds 10
-English.
 ```
 ---
 
@@ -62,7 +61,6 @@ English.
 
 $$\theta_{t+1}^{(M)} = (1 - \eta)\left(\theta_t^{(M)} - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t^{(M)})\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
 
-### Symbol Key
 
 * $\theta_t^{(M)}$: The parameter state of the master model at global step $t$.
 * $\eta$: The global parameter reconciliation blending weight (allocated across the concurrent single-track models).
