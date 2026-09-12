@@ -1,8 +1,32 @@
 #### generative audio transformer in JAX
 
 - continuation of work from `https://github.com/rahilshah13/audio`
+  
+
+<pre>
+[ Shared Checkpoint Bundle / Init Seed Lock ]
+                   |
+         +---------+---------+
+         |                   |
+         v                   v
+[Single-Track Workers]  [Main Training Loop] ---&gt; [Diffusion Transformer]
+         |                       |                         |
+         | (Overfit Tracks)      | (Batch Windows)         v
+         |                       v                 [Empirical NTK]
+         +------------&gt; [Master Weights] &lt;------+         |
+                                |                |         v
+                                v                |    [ntk_logs/*.npy]
+                        [Gradient Updates]       |         |
+                                |                |         v
+                                v                +--- [Meta Daemon] ---&gt; [Spectral MLP Preconditioner]
+                        [Parameter Blend]                             (Scales Gradients)
+</pre>
 
 ---
+
+#### `model.py`
+
+
 
 $$ \mathcal{L}_{\text{total}} = \min_{\theta} \mathbb{E}_{t, \mathbf{X}_0, \boldsymbol{\epsilon}, \mathbf{c}} \left[ \left\| \epsilon_\theta \left( \boldsymbol{\alpha}_t \odot \mathbf{X}_0 + \boldsymbol{\sigma}_t \odot \boldsymbol{\epsilon}, t, \mathbf{c} \right) - \boldsymbol{\epsilon} \right\|^2 + \lambda \left( \left\| \text{STFT}(\mathbf{X}_0) - \text{STFT}(\hat{\mathbf{X}}_0) \right\|_1 + \left\| \mathbf{X}_0 - \hat{\mathbf{X}}_0 \right\|_1 \right) \right] $$
 
@@ -20,7 +44,6 @@ $$ \mathcal{L}_{\text{total}} = \min_{\theta} \mathbb{E}_{t, \mathbf{X}_0, \bold
 
 ---
 
-#### `model.py`
 
 * `rms_norm`: Root Mean Square normalization across feature dimensions.
 * `apply_rope`: Rotary Position Embeddings for queries and keys.
@@ -35,6 +58,21 @@ $$ \mathcal{L}_{\text{total}} = \min_{\theta} \mathbb{E}_{t, \mathbf{X}_0, \bold
 * `raw_memmap_loader`: Yields memory-mapped batch tensors and conditioning tuples.
 * `load_checkpoint_safely`: Loads checkpoint bundles using file locks.
 * `push_and_pull_gradients`: Coordinates distributed gradient accumulation.
+
+
+---
+
+
+$$\theta_{t+1}^{(M)} = (1 - \eta)\left(\theta_t^{(M)} - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t^{(M)})\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
+
+
+* $\theta_t^{(M)}$: The parameter state of the master model at global step $t$.
+* $\eta$: The global parameter reconciliation blending weight (allocated across the concurrent single-track models).
+* $\alpha$: The optimizer learning rate for the master model.
+* $\mathcal{L}_{\text{window}}$: The combined audio loss evaluated on randomly sampled short audio windows.
+* $K$: The total number of concurrent single-track models ($CONCURRENT\_MODELS$).
+* $w_k$: The normalized proportional weight assigned to the $k$-th single-track model ($w_k = \frac{1}{K}$).
+* $\theta_{k, \text{conv}}$: The fully converged parameter state of the $k$-th concurrent model trained to zero loss on a full audio track.
 
 ---
 
@@ -56,18 +94,6 @@ python3 inference.py --generate --seconds 10
 ```
 ---
 
-#### `model2.py`
 
-
-$$\theta_{t+1}^{(M)} = (1 - \eta)\left(\theta_t^{(M)} - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t^{(M)})\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
-
-
-* $\theta_t^{(M)}$: The parameter state of the master model at global step $t$.
-* $\eta$: The global parameter reconciliation blending weight (allocated across the concurrent single-track models).
-* $\alpha$: The optimizer learning rate for the master model.
-* $\mathcal{L}_{\text{window}}$: The combined audio loss evaluated on randomly sampled short audio windows.
-* $K$: The total number of concurrent single-track models ($CONCURRENT\_MODELS$).
-* $w_k$: The normalized proportional weight assigned to the $k$-th single-track model ($w_k = \frac{1}{K}$).
-* $\theta_{k, \text{conv}}$: The fully converged parameter state of the $k$-th concurrent model trained to zero loss on a full audio track.
 
 
