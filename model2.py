@@ -10,6 +10,7 @@ jax.config.update("jax_enable_x64", False)
 CONCURRENT_MODELS = 3
 CURR_CKPT, PREV_CKPT = "checkpoints/checkpoint_bundle.pickle", "checkpoints/checkpoint_bundle_prev.pickle"
 CKPT_LOCK_PATH, GRAD_LOCK_PATH = "checkpoints/checkpoint.lock", "data/shared_gradients.lock"
+INIT_SEED_PATH = "checkpoints/init_seed.lock"
 LIE_PARAMS = {"query", "key", "value"}
 
 # -----------------------------------------------------------------------------
@@ -106,6 +107,24 @@ def init_params(key, dim=1024, patch_dim=441, comp_dim=512, steps=50):
 # 2. Utilities & Data Pipeline (Variable-Length Windows & Full Tracks)
 # -----------------------------------------------------------------------------
 load_checkpoint_safely = lambda: (lambda clf: (fcntl.flock(clf, fcntl.LOCK_EX), res := (pickle.load(open(CURR_CKPT, "rb")) if os.path.exists(CURR_CKPT) else None), fcntl.flock(clf, fcntl.LOCK_UN), res)[-1])(open(CKPT_LOCK_PATH, "a+"))
+
+def get_or_create_init_seed(default_seed=42):
+    with open(INIT_SEED_PATH, "a+") as sf:
+        fcntl.flock(sf, fcntl.LOCK_EX)
+        try:
+            sf.seek(0)
+            content = sf.read().strip()
+            if content:
+                seed = int(content)
+            else:
+                seed = default_seed
+                sf.seek(0)
+                sf.truncate()
+                sf.write(str(seed))
+                sf.flush()
+        finally:
+            fcntl.flock(sf, fcntl.LOCK_UN)
+        return seed
 
 def push_and_pull_gradients(optimizer, local_grads, loss_val, global_step, expected_version, expected_step, worker_id="worker_0", accumulation_steps=4, single_track_params_list=None):
     with open(CKPT_LOCK_PATH, "a+") as clf, open(GRAD_LOCK_PATH, "a+b") as gf:
@@ -292,7 +311,8 @@ if __name__ == "__main__":
     optimizer = optax.adam(1e-4)
     
     if not os.path.exists(CURR_CKPT):
-        init_p = init_params(jax.random.PRNGKey(42))
+        init_seed = get_or_create_init_seed(42)
+        init_p = init_params(jax.random.PRNGKey(init_seed))
         pickle.dump({"params": init_p, "ema_params": init_p, "opt_state": optimizer.init(init_p), "version": 0, "global_step": 0}, open(CURR_CKPT, "wb"))
 
     bundle = load_checkpoint_safely()
