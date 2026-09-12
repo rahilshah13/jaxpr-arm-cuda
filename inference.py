@@ -1,5 +1,6 @@
 """
-This module compiles arbitrary JAX expressions (jaxprs) into ARM64 NEON assembly and NVIDIA CUDA C binaries, linking and executing them concurrently on CPU and GPU hardware threads, and includes generative sampling capabilities.
+This module integrates inference, AOT compilation hooks, and generative sampling
+with the consolidated model backend (model.py).
 
 Usage:
     python3 inference.py --compile --seconds 10
@@ -8,7 +9,6 @@ Usage:
 
 import jax
 import jax.numpy as jnp
-from jax.extend.core import Literal
 import struct
 import subprocess
 import ctypes
@@ -20,6 +20,9 @@ import pickle
 import time
 from scipy.io import wavfile
 from functools import partial
+
+# Import directly from the consolidated model module
+from model import init_params, gpt_forward, load_checkpoint_safely
 
 
 def float_to_hex_halves(f_val):
@@ -42,12 +45,12 @@ def compile_closed_jaxpr_to_arm64(closed_jaxpr):
     ]
 
     if len(jaxpr.invars) > 6:
-        raise NotImplementedError("Only up to 6 inputs supported to respect AAPCS64 register limits with N.")
+        raise NotImplementedError("Only up to 6 inputs supported to respect AAPCS64 register limits.")
 
     literals = {}
     for eqn in jaxpr.eqns:
         for invar in eqn.invars:
-            if isinstance(invar, Literal):
+            if isinstance(invar, jax.extend.core.Literal):
                 val = float(invar.val)
                 if val not in literals:
                     literals[val] = None
@@ -62,7 +65,7 @@ def compile_closed_jaxpr_to_arm64(closed_jaxpr):
     last_use = {}
     for i, eqn in enumerate(jaxpr.eqns):
         for invar in eqn.invars:
-            if not isinstance(invar, Literal):
+            if not isinstance(invar, jax.extend.core.Literal):
                 last_use[invar] = i
     for outvar in jaxpr.outvars:
         last_use[outvar] = len(jaxpr.eqns)
@@ -119,7 +122,7 @@ def compile_closed_jaxpr_to_arm64(closed_jaxpr):
         prim_name = eqn.primitive.name
         
         if prim_name in ["reshape", "broadcast_in_dim", "transpose", "dot_general", "integer_pow"]:
-            if eqn.invars and not isinstance(eqn.invars[0], Literal):
+            if eqn.invars and not isinstance(eqn.invars[0], jax.extend.core.Literal):
                 in_var = eqn.invars[0]
                 if in_var in reg_map and eqn.outvars:
                     reg_map[eqn.outvars[0]] = reg_map[in_var]
@@ -132,7 +135,7 @@ def compile_closed_jaxpr_to_arm64(closed_jaxpr):
         
         input_regs = []
         for invar in eqn.invars:
-            if isinstance(invar, Literal):
+            if isinstance(invar, jax.extend.core.Literal):
                 input_regs.append(literals[float(invar.val)])
             else:
                 input_regs.append(reg_map.get(invar, "v8.4s"))
@@ -193,7 +196,7 @@ def compile_closed_jaxpr_to_cuda(closed_jaxpr):
     for eqn in jaxpr.eqns:
         prim_name = eqn.primitive.name
         if prim_name in ["reshape", "broadcast_in_dim", "transpose", "dot_general", "integer_pow"]:
-            if eqn.invars and not isinstance(eqn.invars[0], Literal) and eqn.outvars:
+            if eqn.invars and not isinstance(eqn.invars[0], jax.extend.core.Literal) and eqn.outvars:
                 var_map[eqn.outvars[0]] = get_cvar(eqn.invars[0])
             continue
 
@@ -203,7 +206,7 @@ def compile_closed_jaxpr_to_cuda(closed_jaxpr):
         out_cvar = get_cvar(eqn.outvars[0])
         op_strs = []
         for invar in eqn.invars:
-            if isinstance(invar, Literal):
+            if isinstance(invar, jax.extend.core.Literal):
                 op_strs.append(f"{float(invar.val)}f")
             else:
                 op_strs.append(get_cvar(invar))
@@ -324,9 +327,8 @@ class HeterogeneousRuntime:
         used_backends = []
         start_time = time.time()
 
-        # Guard native assembly execution to prevent hard process termination on unaligned memory offsets
         def run_arm():
-            if self.lib_arm and padded_N <= 16384:  # Safe inline buffer limit for raw JIT loop
+            if self.lib_arm and padded_N <= 16384:
                 try:
                     self.lib_arm.jax_arm64_simd_kernel.argtypes = [ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * len(inputs)
                     self.lib_arm.jax_arm64_simd_kernel(ptr_padded_out, ctypes.c_int(padded_N), *ptr_padded_inputs)
@@ -368,8 +370,6 @@ class HeterogeneousRuntime:
 
 
 if __name__ == "__main__":
-    from model import init_params, gpt_forward, load_checkpoint_safely
-
     seconds = 10
     if "--seconds" in sys.argv:
         try:
