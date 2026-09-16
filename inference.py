@@ -3,8 +3,8 @@ This module integrates inference, AOT compilation hooks, and generative sampling
 with the consolidated model backend (model.py).
 
 Usage:
-    python3 inference.py --compile --seconds 10
-    python3 inference.py --generate --seconds 10
+    python3 inference.py --compile --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle
+    python3 inference.py --generate --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle
 """
 
 import jax
@@ -18,11 +18,12 @@ import os
 import sys
 import pickle
 import time
+import argparse
 from scipy.io import wavfile
 from functools import partial
 
 # Import directly from the consolidated model module
-from model import init_params, gpt_forward, load_checkpoint_safely
+from model import init_params, gpt_forward, load_checkpoint_safely, _load_params_from_bundle
 
 
 def float_to_hex_halves(f_val):
@@ -370,35 +371,52 @@ class HeterogeneousRuntime:
 
 
 if __name__ == "__main__":
-    seconds = 10
-    if "--seconds" in sys.argv:
-        try:
-            seconds = int(sys.argv[sys.argv.index("--seconds") + 1])
-        except (ValueError, IndexError):
-            pass
+    parser = argparse.ArgumentParser(description="Multimodal JAX Inference & AOT Compiler Engine")
+    parser.add_argument("--compile", action="store_true", help="Run AOT compilation hooks")
+    parser.add_argument("--generate", action="store_true", help="Run generative sampling")
+    parser.add_argument("--seconds", type=int, default=10, help="Duration in seconds")
+    parser.add_argument("--ckpt-mix", type=str, default="checkpoints/checkpoint_bundle.pickle", 
+                        help="Comma-separated list of checkpoint bundles to mix/load")
+    args = parser.parse_args()
 
-    if "--compile" in sys.argv:
-        print(f"[AOT Runtime] Initializing model parameters for AOT compilation ({seconds}s)...")
-        bundle = load_checkpoint_safely()
-        if not bundle:
+    ckpt_paths = [p.strip() for p in args.ckpt_mix.split(",")]
+    primary_ckpt = ckpt_paths[0]
+
+    def load_mixed_params():
+        if not os.path.exists(primary_ckpt):
+            return None
+        bundle = _load_params_from_bundle(primary_ckpt) if isinstance(_load_params_from_bundle(primary_ckpt), dict) else load_checkpoint_safely()
+        params = bundle["params"] if isinstance(bundle, dict) and "params" in bundle else bundle
+        if len(ckpt_paths) > 1:
+            print(f"[Inference] Blending checkpoint mix from paths: {ckpt_paths}")
+            for alt_path in ckpt_paths[1:]:
+                if os.path.exists(alt_path):
+                    alt_p = _load_params_from_bundle(alt_path)
+                    params = jax.tree_util.tree_map(lambda p1, p2: 0.5 * p1 + 0.5 * p2, params, alt_p)
+        return bundle, params
+
+    if args.compile:
+        print(f"[AOT Runtime] Initializing model parameters for AOT compilation ({args.seconds}s)...")
+        res = load_mixed_prev_bundle = load_mixed_params()
+        if not res:
             print("[AOT Runtime] Error: No checkpoint bundle found. Train the model first.")
             sys.exit(1)
 
-        params = bundle.get("ema_params", bundle["params"])
+        bundle, params = res
         os.makedirs("output", exist_ok=True)
 
         samples_per_sec = 44100
-        dummy_x = jnp.zeros((1, seconds, samples_per_sec), dtype=jnp.float32)
+        dummy_x = jnp.zeros((1, args.seconds, samples_per_sec), dtype=jnp.float32)
         dummy_cond = (
             jnp.zeros((1,), dtype=jnp.int32),
             jnp.zeros((1,), dtype=jnp.float32),
             jnp.zeros((1,), dtype=jnp.int32),
-            jnp.zeros((1, seconds), dtype=jnp.int32),
-            jnp.zeros((1, seconds), dtype=jnp.float32)
+            jnp.zeros((1, args.seconds), dtype=jnp.int32),
+            jnp.zeros((1, args.seconds), dtype=jnp.float32)
         )
 
         print("[AOT Runtime] Tracing model execution jaxpr and compiling heterogeneous runtime...")
-        closed_jaxpr = jax.make_jaxpr(partial(gpt_forward, params))(dummy_x, dummy_cond)
+        closed_jaxpr = jax.make_jaxpr(partial(gpt_forward, params, modality_type="audio"))(dummy_x, dummy_cond)
 
         arm_asm = compile_closed_jaxpr_to_arm64(closed_jaxpr)
         cuda_code = compile_closed_jaxpr_to_cuda(closed_jaxpr)
@@ -408,12 +426,12 @@ if __name__ == "__main__":
         print("[AOT Runtime] Heterogeneous runtime compiled successfully.")
 
         key = jax.random.PRNGKey(1337)
-        noise = jnp.array(jax.random.normal(key, (1, seconds, samples_per_sec)))
+        noise = jnp.array(jax.random.normal(key, (1, args.seconds, samples_per_sec)))
         scale = jnp.array([64], dtype=jnp.int32)
         bpm = jnp.array([120.0], dtype=jnp.float32)
         stem = jnp.array([0], dtype=jnp.int32)
-        steps_arr = jnp.zeros((1, seconds), dtype=jnp.int32)
-        sigmas_arr = jnp.ones((1, seconds), dtype=jnp.float32)
+        steps_arr = jnp.zeros((1, args.seconds), dtype=jnp.int32)
+        sigmas_arr = jnp.ones((1, args.seconds), dtype=jnp.float32)
         cond = (scale, bpm, stem, steps_arr, sigmas_arr)
 
         print("[AOT Runtime] Executing generation pass via compiled runtime...")
@@ -421,45 +439,45 @@ if __name__ == "__main__":
         cpu_res, gpu_res = runtime.execute_concurrently(noise)
         print(f"[AOT Runtime] Total generation pass duration: {time.time() - start_gen:.4f}s")
 
-        generated_audio = gpt_forward(params, noise, cond)
+        generated_audio = gpt_forward(params, noise, cond, modality_type="audio")
         flat_audio = np.array(generated_audio.reshape(-1), dtype=np.float32)
         
         flat_audio = np.clip(flat_audio, -1.0, 1.0)
-        output_path = f"output/compiled_generated_{seconds}s.wav"
+        output_path = f"output/compiled_generated_{args.seconds}s.wav"
         wavfile.write(output_path, samples_per_sec, (flat_audio * 32767).astype(np.int16))
         print(f"[AOT Runtime] Audio successfully exported to {output_path}")
 
-    elif "--generate" in sys.argv:
-        print(f"[Generation Engine] Generating {seconds} seconds of audio using EMA weights...")
-        bundle = load_checkpoint_safely()
-        if not bundle:
+    elif args.generate:
+        print(f"[Generation Engine] Generating {args.seconds} seconds of audio using mixed weights...")
+        res = load_mixed_params()
+        if not res:
             print("[Generation Engine] Error: No checkpoint bundle found. Train the model first.")
             sys.exit(1)
 
-        params = bundle.get("ema_params", bundle["params"])
+        bundle, params = res
         os.makedirs("output", exist_ok=True)
         
         samples_per_sec = 44100
         key = jax.random.PRNGKey(1337)
-        noise = jax.random.normal(key, (1, seconds, samples_per_sec))
+        noise = jax.random.normal(key, (1, args.seconds, samples_per_sec))
         
         scale = jnp.array([64], dtype=jnp.int32)
         bpm = jnp.array([120.0], dtype=jnp.float32)
         stem = jnp.array([0], dtype=jnp.int32)
-        steps_arr = jnp.zeros((1, seconds), dtype=jnp.int32)
-        sigmas_arr = jnp.ones((1, seconds), dtype=jnp.float32)
+        steps_arr = jnp.zeros((1, args.seconds), dtype=jnp.int32)
+        sigmas_arr = jnp.ones((1, args.seconds), dtype=jnp.float32)
         cond = (scale, bpm, stem, steps_arr, sigmas_arr)
 
         print("[Generation Engine] Running forward generation pass...")
         start_gen = time.time()
-        generated_audio = gpt_forward(params, noise, cond)
+        generated_audio = gpt_forward(params, noise, cond, modality_type="audio")
         print(f"[Generation Engine] Generation completed in {time.time() - start_gen:.4f}s using standard JAX XLA engine.")
         
         flat_audio = np.array(generated_audio.reshape(-1), dtype=np.float32)
         flat_audio = np.clip(flat_audio, -1.0, 1.0)
-        output_path = f"output/generated_{seconds}s.wav"
+        output_path = f"output/generated_{args.seconds}s.wav"
         wavfile.write(output_path, samples_per_sec, (flat_audio * 32767).astype(np.int16))
         print(f"[Generation Engine] Audio successfully exported to {output_path}")
 
     else:
-        print("Usage: python3 inference.py [--compile --seconds <N> | --generate --seconds <N>]")
+        print("Usage: python3 inference.py [--compile --seconds <N> | --generate --seconds <N>] [--ckpt-mix <path1,path2>]")
