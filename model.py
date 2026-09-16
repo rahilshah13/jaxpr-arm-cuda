@@ -7,12 +7,16 @@ from jax.extend.core import Literal
 from scipy.io import wavfile
 from functools import partial, reduce
 
+from processing import raw_memmap_loader, get_full_track_data, get_cached_metadata
+
 jax.config.update("jax_default_matmul_precision", "float32")
 jax.config.update("jax_enable_x64", False)
 
 CONCURRENT_MODELS = 3
 CURR_CKPT, PREV_CKPT = "checkpoints/checkpoint_bundle.pickle", "checkpoints/checkpoint_bundle_prev.pickle"
 CKPT_LOCK_PATH, GRAD_LOCK_PATH = "checkpoints/checkpoint.lock", "data/shared_gradients.lock"
+META_LOCK_PATH = "checkpoints/meta.lock"
+NTK_LOCK_PATH = "checkpoints/ntk.lock"
 INIT_SEED_PATH = "checkpoints/init_seed.lock"
 LIE_PARAMS = {"query", "key", "value"}
 
@@ -25,10 +29,6 @@ scaled_dot_product_attention = lambda q, k, v, mask=None: jnp.matmul(jax.nn.soft
 clamp_frobenius_norm = lambda w, steps=2: reduce(lambda mat, _: jnp.where((n := jnp.sqrt(jnp.sum(mat * mat))) > 1.0, mat / n, mat), range(steps), w)
 
 def multimodal_mixing_layer(x, modality_type, params, target_dim=1024, comp_dim=512):
-    """
-    Decouples encoding types by mapping disparate modalities (audio, token/text)
-    into a uniform fixed-dimension representation space for the core transformer.
-    """
     if modality_type == "audio":
         patch_dim = 441
         B, T, L = x.shape
@@ -131,7 +131,7 @@ def init_params(key, dim=1024, patch_dim=441, comp_dim=512, steps=50):
     }
 
 # -----------------------------------------------------------------------------
-# 2. Meta-Preconditioner & Spectral Daemon Components
+# 2. Meta-Preconditioner & Synchronized Spectral Daemon Components
 # -----------------------------------------------------------------------------
 align_drift = lambda w_new, w_old: jnp.linalg.norm(ravel_pytree(w_new)[0] - ravel_pytree(w_old)[0]) / (jnp.linalg.norm(ravel_pytree(w_new)[0]) + 1e-6)
 
@@ -196,8 +196,14 @@ def get_meta_preconditioner(grads, loss=None):
     raw_jac = jnp.pad(raw_jac, (0, max(0, 1024 - raw_jac.shape[0])))[:1024]
 
     ntk_data = jnp.concatenate([raw_jac, jnp.array([drift, loss_val])])
-    with open(meta_ckpt, "rb") as f:
-        meta_params = pickle.load(f)
+    
+    with open(META_LOCK_PATH, "a+") as mf:
+        fcntl.flock(mf, fcntl.LOCK_EX)
+        try:
+            with open(meta_ckpt, "rb") as f:
+                meta_params = pickle.load(f)
+        finally:
+            fcntl.flock(mf, fcntl.LOCK_UN)
 
     flat_grads, treedef = ravel_pytree(grads)
     model = SpectralPreconditionerMLP()
@@ -218,6 +224,7 @@ def train_meta_step(params, opt_state, tx, inputs):
 
 def run_meta_daemon():
     os.makedirs("ntk_logs", exist_ok=True)
+    meta_ckpt = "checkpoints/meta_preconditioner.pickle"
     dashboard = MetaDashboard()
     params, opt_state, tx = None, None, optax.adam(1e-4)
 
@@ -236,14 +243,20 @@ def run_meta_daemon():
 
                 loss, params, opt_state = train_meta_step(params, opt_state, tx, ntk_data)
                 dashboard.update(float(loss))
-                with open("checkpoints/meta_preconditioner.pickle", "wb") as f:
-                    pickle.dump(params, f)
+                
+                with open(META_LOCK_PATH, "a+") as mf:
+                    fcntl.flock(mf, fcntl.LOCK_EX)
+                    try:
+                        with open(meta_ckpt, "wb") as f:
+                            pickle.dump(params, f)
+                    finally:
+                        fcntl.flock(mf, fcntl.LOCK_UN)
             except Exception:
                 pass
         time.sleep(5)
 
 # -----------------------------------------------------------------------------
-# 3. Utilities & Data Pipeline
+# 3. Synchronized Checkpoint & Gradient Utilities
 # -----------------------------------------------------------------------------
 load_checkpoint_safely = lambda: (lambda clf: (fcntl.flock(clf, fcntl.LOCK_EX), res := (pickle.load(open(CURR_CKPT, "rb")) if os.path.exists(CURR_CKPT) else None), fcntl.flock(clf, fcntl.LOCK_UN), res)[-1])(open(CKPT_LOCK_PATH, "a+"))
 
@@ -296,107 +309,12 @@ def push_and_pull_gradients(optimizer, local_grads, loss_val, global_step, expec
     bundle = load_checkpoint_safely()
     return bundle["params"], bundle.get("ema_params", bundle["params"]), bundle.get("version", expected_version), False
 
-def get_cached_metadata(meta_path):
-    if not os.path.exists(meta_path): return []
-    with open(meta_path, "r") as f: return [json.loads(l) for l in f if l.strip()]
-
-def get_full_track_data(samples_per_sec=44100, num_diffusion_steps=50):
-    meta_path = "data/audio_vault.meta.jsonl"
-    while True:
-        metadata = get_cached_metadata(meta_path)
-        if not metadata: time.sleep(0.5); continue
-        entry = metadata[np.random.randint(len(metadata))]
-        shard_path = os.path.join("data", entry.get("shard", "shard_0.bin"))
-        if not os.path.exists(shard_path): continue
-        
-        track_duration = entry.get("duration", (os.path.getsize(shard_path) // 4 - entry.get("offset_bytes", 0) // 4) / samples_per_sec)
-        seq_len = int(track_duration)
-        if seq_len < 2: continue
-        
-        offset_frames = entry.get("offset_bytes", 0) // 4
-        mmap_arr = np.memmap(shard_path, dtype=np.float32, mode='r').reshape(-1)
-        patches = [mmap_arr[offset_frames + (i * samples_per_sec) : offset_frames + ((i + 1) * samples_per_sec)].reshape(-1) for i in range(seq_len)]
-        steps_arr = [int(np.random.randint(0, num_diffusion_steps)) for _ in range(seq_len)]
-        sigma_vals = [float(np.sin((s + 1.0) / float(num_diffusion_steps) * np.pi / 2.0)) for s in steps_arr]
-        
-        raw_url = entry.get("url", "unknown_url")
-        yt_id = raw_url.split("v=")[-1].split("&")[0] if "v=" in raw_url else "yt_0"
-        return (
-            np.stack(patches)[None, :, :],
-            int(entry.get("scale", 0)),
-            float(entry.get("bpm", 120.0)),
-            int(entry.get("stem", 0)),
-            np.array(steps_arr, dtype=np.int32)[None, :],
-            np.array(sigma_vals, dtype=np.float32)[None, :],
-            yt_id
-        )
-
-def raw_memmap_loader(batch_size, min_seq_len=4, max_seq_len=16, samples_per_sec=44100, num_diffusion_steps=50):
-    meta_path = "data/audio_vault.meta.jsonl"
-    pool = {}
-    while True:
-        metadata = get_cached_metadata(meta_path)
-        if not metadata: time.sleep(0.5); continue
-            
-        raw_samples = []
-        max_T = 0
-        while len(raw_samples) < batch_size:
-            entry = metadata[np.random.randint(len(metadata))]
-            shard_path = os.path.join("data", entry.get("shard", "shard_0.bin"))
-            if not os.path.exists(shard_path): continue
-            
-            seq_len = int(np.random.randint(min_seq_len, max_seq_len + 1))
-            track_duration = entry.get("duration", (os.path.getsize(shard_path) // 4 - entry.get("offset_bytes", 0) // 4) / samples_per_sec)
-            if track_duration < seq_len: continue
-            
-            offset_frames = entry.get("offset_bytes", 0) // 4
-            if shard_path not in pool: pool[shard_path] = np.memmap(shard_path, dtype=np.float32, mode='r').reshape(-1)
-            mmap_arr = pool[shard_path]
-            
-            start_idx = int(np.random.uniform(0, track_duration - seq_len) * samples_per_sec)
-            patches = [mmap_arr[offset_frames + start_idx + (i * samples_per_sec) : offset_frames + start_idx + ((i + 1) * samples_per_sec)].reshape(-1) for i in range(seq_len)]
-            steps_arr = [int(np.random.randint(0, num_diffusion_steps)) for _ in range(seq_len)]
-            sigma_vals = [float(np.sin((s + 1.0) / float(num_diffusion_steps) * np.pi / 2.0)) for s in steps_arr]
-            
-            raw_url = entry.get("url", "unknown_url")
-            yt_id = raw_url.split("v=")[-1].split("&")[0] if "v=" in raw_url else "yt_0"
-            tw_str = f"{start_idx / samples_per_sec:.0f}s-{(start_idx / samples_per_sec) + seq_len:.0f}s"
-            
-            max_T = max(max_T, seq_len)
-            raw_samples.append({
-                "patches": np.stack(patches), "scale": int(entry.get("scale", 0)),
-                "bpm": float(entry.get("bpm", 120.0)), "stem": int(entry.get("stem", 0)),
-                "steps": np.array(steps_arr, dtype=np.int32), "sigmas": np.array(sigma_vals, dtype=np.float32),
-                "id": (yt_id, tw_str), "len": seq_len, "modality": "audio"
-            })
-            
-        batch_x, batch_scales, batch_bpms, batch_stems, batch_steps, batch_sigmas, batch_masks, batch_ids, batch_modalities = [], [], [], [], [], [], [], [], []
-        for item in raw_samples:
-            L = item["len"]
-            pad_len = max_T - L
-            padded_patches = np.pad(item["patches"], ((0, pad_len), (0, 0)), 'constant') if pad_len > 0 else item["patches"]
-            padded_steps = np.pad(item["steps"], (0, pad_len), 'constant') if pad_len > 0 else item["steps"]
-            padded_sigmas = np.pad(item["sigmas"], (0, pad_len), 'constant') if pad_len > 0 else item["sigmas"]
-            mask = np.concatenate([np.ones(L, dtype=bool), np.zeros(pad_len, dtype=bool)]) if pad_len > 0 else np.ones(L, dtype=bool)
-            
-            batch_x.append(padded_patches)
-            batch_scales.append(item["scale"])
-            batch_bpms.append(item["bpm"])
-            batch_stems.append(item["stem"])
-            batch_steps.append(padded_steps)
-            batch_sigmas.append(padded_sigmas)
-            batch_masks.append(mask)
-            batch_ids.append(item["id"])
-            batch_modalities.append(item["modality"])
-            
-        yield np.stack(batch_x), np.array(batch_scales, dtype=np.int32), np.array(batch_bpms, dtype=np.float32), np.array(batch_stems, dtype=np.int32), np.stack(batch_steps), np.stack(batch_sigmas), np.stack(batch_masks), batch_ids, batch_modalities
-
-def run_single_track_worker(worker_idx, initial_params):
+def run_single_track_worker(worker_idx, initial_params, quantization="fp32"):
     optimizer = optax.adam(1e-4)
     params = initial_params
     opt_state = optimizer.init(params)
     
-    track_data, scale, bpm, stem, steps, sigmas, yt_id = get_full_track_data()
+    track_data, scale, bpm, stem, steps, sigmas, yt_id = get_full_track_data(quantization=quantization)
     step = 0
     while True:
         scales = np.array([scale], dtype=np.int32)
@@ -413,13 +331,15 @@ def run_single_track_worker(worker_idx, initial_params):
     return params
 
 # -----------------------------------------------------------------------------
-# 4. Main Execution & Integration Interface
+# 4. Main Execution & Synchronized Daemon Interface
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Multimodal JAX Diffusion Transformer Trainer")
-    parser.add_argument("--train", action="store_true", help="Launch the training daemon")
+    parser = argparse.ArgumentParser(description="Synchronized Multimodal JAX Diffusion Transformer Daemon")
+    parser.add_argument("--train", action="store_true", help="Launch the synchronized training daemon loop")
     parser.add_argument("--ckpt-mix", type=str, default="checkpoints/checkpoint_bundle.pickle", 
                         help="Comma-separated list of checkpoint bundles to mix/load")
+    parser.add_argument("--quantization", type=str, default="fp32", choices=["fp32", "fp16", "int8", "int4"],
+                        help="Data ingestion quantization fidelity tier")
     args = parser.parse_args()
 
     os.makedirs("data", exist_ok=True)
@@ -431,16 +351,22 @@ if __name__ == "__main__":
     ckpt_paths = [p.strip() for p in args.ckpt_mix.split(",")]
     primary_ckpt = ckpt_paths[0]
     
-    if not os.path.exists(primary_ckpt):
-        init_seed = get_or_create_init_seed(42)
-        init_p = init_params(jax.random.PRNGKey(init_seed))
-        pickle.dump({"params": init_p, "ema_params": init_p, "opt_state": optimizer.init(init_p), "version": 0, "global_step": 0}, open(primary_ckpt, "wb"))
+    # Atomic initialization of master seed and checkpoint bundle across concurrent containers
+    seed_key = get_or_create_init_seed(42)
+    with open(CKPT_LOCK_PATH, "a+") as clf:
+        fcntl.flock(clf, fcntl.LOCK_EX)
+        try:
+            if not os.path.exists(primary_ckpt):
+                init_p = init_params(jax.random.PRNGKey(seed_key))
+                pickle.dump({"params": init_p, "ema_params": init_p, "opt_state": optimizer.init(init_p), "version": 0, "global_step": 0}, open(primary_ckpt, "wb"))
+        finally:
+            fcntl.flock(clf, fcntl.LOCK_UN)
 
-    bundle = _load_params_from_bundle(primary_ckpt) if isinstance(_load_params_from_bundle(primary_ckpt), dict) else load_checkpoint_safely()
+    bundle = load_checkpoint_safely()
     params = bundle["params"] if isinstance(bundle, dict) and "params" in bundle else bundle
 
     if len(ckpt_paths) > 1:
-        print(f"[Trainer] Blending checkpoint mix from paths: {ckpt_paths}")
+        print(f"[Daemon] Blending checkpoint mix from paths: {ckpt_paths}")
         for alt_path in ckpt_paths[1:]:
             if os.path.exists(alt_path):
                 alt_p = _load_params_from_bundle(alt_path)
@@ -453,15 +379,15 @@ if __name__ == "__main__":
     if args.train:
         single_track_params_results = [None] * CONCURRENT_MODELS
         def spawn_worker(w_idx, init_p):
-            single_track_params_results[w_idx] = run_single_track_worker(w_idx, init_p)
+            single_track_params_results[w_idx] = run_single_track_worker(w_idx, init_p, quantization=args.quantization)
 
         threads = [threading.Thread(target=spawn_worker, args=(i, params), daemon=True) for i in range(CONCURRENT_MODELS)]
         for t in threads: t.start()
 
         threading.Thread(target=run_meta_daemon, daemon=True).start()
 
-        print(f"[Trainer] Launching integrated multimodal training loop at global step {global_step} (Version {version}).")
-        loader = raw_memmap_loader(batch_size=8, min_seq_len=4, max_seq_len=16, samples_per_sec=44100, num_diffusion_steps=50)
+        print(f"[Daemon] Launching synchronized multimodal training daemon at global step {global_step} | Quantization: {args.quantization.upper()} (Version {version}).")
+        loader = raw_memmap_loader(batch_size=8, min_seq_len=4, max_seq_len=16, samples_per_sec=44100, num_diffusion_steps=50, quantization=args.quantization)
         try:
             for batch_data in loader:
                 batch_x, scales, bpms, stems, steps, sigmas, masks, batch_ids, batch_modalities = batch_data
@@ -470,21 +396,31 @@ if __name__ == "__main__":
 
                 loss_val, grads = jax.value_and_grad(lambda p: combined_audio_loss(gpt_forward(p, jnp.cos(sigmas * np.pi / 2.0)[:, :, None] * batch_x + jnp.sin(sigmas * np.pi / 2.0)[:, :, None] * jax.random.normal(jax.random.PRNGKey(0), batch_x.shape), cond, masks, modality_type=modality_type), jax.random.normal(jax.random.PRNGKey(0), batch_x.shape), masks))(params)
                 
-                print(f"\n[Trainer] Step {global_step:04d} | Modality: {modality_type} | Batch Loss: {float(loss_val):.4f} | Real Loss (0-1): {1.0/(1.0+float(loss_val)):.4f} | Version: {version}")
+                print(f"\n[Daemon] Step {global_step:04d} | Modality: {modality_type} | Quantization: {args.quantization} | Batch Loss: {float(loss_val):.4f} | Version: {version}")
 
                 preconditioned_grads = get_meta_preconditioner(grads, loss_val)
                 if preconditioned_grads is not None:
                     grads = preconditioned_grads
                     print("  -> [Meta] Gradients successfully preconditioned by spectral MLP.")
                 
+                # Guard NTK calculation with an exclusive lock so only one container/instance computes it per milestone step
                 if global_step % 10 == 0:
-                    ntk = compute_empirical_ntk(params, batch_x, scales, bpms, stems, steps, sigmas, masks, modality_type=modality_type)
-                    print(f"  -> [NTK] Trace: {ntk['trace']:.4f} | Condition Number: {ntk['condition_number']:.4f}")
-                    pickle.dump(ntk, open(f"checkpoints/ntk/ntk_step_{global_step:04d}.pickle", "wb"))
-                    np.save(f"ntk_logs/ntk_step_{global_step:04d}.npy", ntk["matrix"].flatten())
+                    ntk_pickle_path = f"checkpoints/ntk/ntk_step_{global_step:04d}.pickle"
+                    with open(NTK_LOCK_PATH, "a+") as ntf:
+                        fcntl.flock(ntf, fcntl.LOCK_EX)
+                        try:
+                            if not os.path.exists(ntk_pickle_path):
+                                ntk = compute_empirical_ntk(params, batch_x, scales, bpms, stems, steps, sigmas, masks, modality_type=modality_type)
+                                print(f"  -> [NTK] Computed & Logged Trace: {ntk['trace']:.4f} | Condition Number: {ntk['condition_number']:.4f}")
+                                pickle.dump(ntk, open(ntk_pickle_path, "wb"))
+                                np.save(f"ntk_logs/ntk_step_{global_step:04d}.npy", ntk["matrix"].flatten())
+                            else:
+                                print(f"  -> [NTK] Step {global_step:04d} already computed by another instance. Skipping redundant calculation.")
+                        finally:
+                            fcntl.flock(ntf, fcntl.LOCK_UN)
 
                 active_single_params = [res for res in single_track_params_results if res is not None]
                 params, ema_params, version, updated = push_and_pull_gradients(optimizer, grads, loss_val, global_step, version, global_step, accumulation_steps=4, single_track_params_list=active_single_params)
                 global_step += 1
         except KeyboardInterrupt:
-            print("\n[Trainer] Training interrupted safely.")
+            print("\n[Daemon] Training daemon interrupted safely.")
