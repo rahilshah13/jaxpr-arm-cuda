@@ -17,7 +17,7 @@ A generative diffusion transformer implemented in **JAX**, featuring empirical N
                        [Gradient Updates]      │           │
                                │               │           ▼
                                ▼               +─── [Meta Daemon] ───> [Spectral MLP Preconditioner]
-                       [Parameter Blend]                               (Scales Gradients)
+                       [Parameter Blend]                               (Scales Gradients + RLHF)
 
 ```
 
@@ -47,30 +47,25 @@ $$\theta_{t+1} = (1 - \eta)\left(\theta_t - \alpha \nabla \mathcal{L}_{\text{win
 
 ---
 
-* `model.py`: Implements the hierarchical diffusion transformer, multi-head attention blocks, Rotary Position Embeddings, and the empirical NTK spectral preconditioning daemon.
+* `model.py`: Implements the hierarchical diffusion transformer, multi-head attention blocks, Rotary Position Embeddings, and the empirical NTK/RLHF spectral preconditioning daemon.
 * `processing.py`: Manages the background vault ingestion daemon via file-locked polling of URLs, Demucs stem separation, and quantization-aware memory-mapped loading.
 * `inference.py`: Translates JAX expressions into optimized ARM64 NEON assembly kernels and NVIDIA CUDA C runtime binaries for concurrent heterogeneous execution.
+* `discriminator.py`: Manages 0–10 sample grading for human feedback (RLHF) to dynamically weight gradient updates.
+* `main.py`: Container orchestrator hosting the FastAPI backend and reactive SolidJS/Tailwind command center dashboard over WebSockets.
 
 ---
 
 ```bash
-# Environment Setup & Dependencies
-brew install deno
-python3 -m venv .venv
-source .venv/bin/activate
-pip3 install jax jaxlib optax numpy demucs scipy yt-dlp matplotlib
+# application build and execution: 
+docker build -t audio-transformer .
+docker run -p 8000:8000 --gpus all audio-transformer
 
-# Run Ingestion Daemon (Watching data/urls.txt)
+# CLI module execution:
 python3 processing.py --ingest-daemon
-
-# Launch Training Daemon instance
 python3 model.py --train --ckpt-mix checkpoints/checkpoint_bundle.pickle --quantization fp32
-
-# Compile AOT Runtimes & Generate Audio
-python3 inference.py --compile --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle
-python3 inference.py --generate --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle
+python3 discriminator.py
 ```
 
 ---
 
-- continuation of [previous work](https://github.com/rahilshah13/audio)
+* continuation of [previous work](https://github.com/rahilshah13/audio)
