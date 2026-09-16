@@ -1,4 +1,4 @@
-import os, json, pickle, queue, threading, time, sys, struct, subprocess, ctypes, fcntl, shutil, glob, optax, jax
+import os, json, pickle, queue, threading, time, sys, struct, subprocess, ctypes, fcntl, shutil, glob, optax, jax, argparse
 import numpy as np, jax.numpy as jnp
 import matplotlib.pyplot as plt
 from flax import linen as nn
@@ -17,12 +17,31 @@ INIT_SEED_PATH = "checkpoints/init_seed.lock"
 LIE_PARAMS = {"query", "key", "value"}
 
 # -----------------------------------------------------------------------------
-# 1. Transformer Architecture & Diffusion Core
+# 1. Transformer Architecture, Multimodal Mixing & Diffusion Core
 # -----------------------------------------------------------------------------
 rms_norm = lambda x, scale, eps=1e-5: x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps) * scale
 apply_rope = lambda x, freq=10000.0: (lambda c, s: x.at[..., 0::2].set(x[..., 0::2]*c - x[..., 1::2]*s).at[..., 1::2].set(x[..., 0::2]*s + x[..., 1::2]*c))(jnp.cos(jnp.arange(x.shape[-2], dtype=jnp.float32)[None, :, None] / (freq ** (jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1]))), jnp.sin(jnp.arange(x.shape[-2], dtype=jnp.float32)[None, :, None] / (freq ** (jnp.arange(0, x.shape[-1], 2, dtype=jnp.float32) / x.shape[-1]))))
 scaled_dot_product_attention = lambda q, k, v, mask=None: jnp.matmul(jax.nn.softmax(jnp.matmul(q, jnp.swapaxes(k, -2, -1)) * (1.0 / jnp.sqrt(q.shape[-1])) + (mask if mask is not None else 0.0), axis=-1), v)
 clamp_frobenius_norm = lambda w, steps=2: reduce(lambda mat, _: jnp.where((n := jnp.sqrt(jnp.sum(mat * mat))) > 1.0, mat / n, mat), range(steps), w)
+
+def multimodal_mixing_layer(x, modality_type, params, target_dim=1024, comp_dim=512):
+    """
+    Decouples encoding types by mapping disparate modalities (audio, token/text)
+    into a uniform fixed-dimension representation space for the core transformer.
+    """
+    if modality_type == "audio":
+        patch_dim = 441
+        B, T, L = x.shape
+        num_patches = L // patch_dim
+        encoded = jax.nn.gelu(x.reshape(B, T, num_patches, patch_dim) @ params['audio_encoder']) @ params['down_proj_2']
+        return encoded, num_patches
+    elif modality_type == "token":
+        B, T, D = x.shape
+        token_enc = params.get('token_encoder', params['audio_encoder'][:D, :comp_dim])
+        encoded = jax.nn.gelu(x @ token_enc) @ params['down_proj_2']
+        return encoded, 1
+    else:
+        raise ValueError(f"Unsupported modality type: {modality_type}")
 
 def combined_audio_loss(pred, target, mask=None, n_fft=1024):
     if mask is not None:
@@ -32,8 +51,8 @@ def combined_audio_loss(pred, target, mask=None, n_fft=1024):
     xf, yf = map(lambda arr: jnp.abs(jnp.fft.rfft(arr.reshape(-1, n_fft))), (pf, nf))
     return jnp.mean(jnp.abs(xf - yf)) + jnp.mean(jnp.square(jnp.log(xf + 1e-5) - jnp.log(yf + 1e-5))) + 0.5 * jnp.mean(jnp.abs(pred - target))
 
-def compute_empirical_ntk(params, batch_x, scales, bpms, stems, steps, sigmas, mask=None):
-    model_fn = lambda p: gpt_forward(p, jnp.cos(sigmas * jnp.pi / 2.0)[:, :, None] * batch_x + jnp.sin(sigmas * jnp.pi / 2.0)[:, :, None] * jax.random.normal(jax.random.PRNGKey(0), batch_x.shape), (scales, bpms, stems, steps, sigmas), mask)
+def compute_empirical_ntk(params, batch_x, scales, bpms, stems, steps, sigmas, mask=None, modality_type="audio"):
+    model_fn = lambda p: gpt_forward(p, jnp.cos(sigmas * jnp.pi / 2.0)[:, :, None] * batch_x + jnp.sin(sigmas * jnp.pi / 2.0)[:, :, None] * jax.random.normal(jax.random.PRNGKey(0), batch_x.shape), (scales, bpms, stems, steps, sigmas), mask, modality_type=modality_type)
     _, vjp_fun = jax.vjp(model_fn, params)
     dummy = model_fn(params)
     
@@ -56,29 +75,29 @@ def compute_empirical_ntk(params, batch_x, scales, bpms, stems, steps, sigmas, m
         "trace": float(jnp.trace(ntk) / float(num_slices))
     }
 
-def gpt_forward(params, x, cond, mask=None, target_dim=44100, patch_dim=441, num_patches=100, n_heads=16):
+def gpt_forward(params, x, cond, mask=None, target_dim=44100, patch_dim=441, num_patches=100, n_heads=16, modality_type="audio"):
     scale, bpm, stem, step_indices, sigma_t = cond
-    B, T, L = x.shape
+    B, T = x.shape[0], x.shape[1]
     
     x = rms_norm(x, params['input_rms_scale'])
     
-    encoded = jax.nn.gelu(x.reshape(B, T, num_patches, patch_dim) @ params['audio_encoder']) @ params['down_proj_2']
+    encoded, num_p = multimodal_mixing_layer(x, modality_type, params)
     C, bt = encoded.shape[-1], B * T
     head_dim = C // n_heads
     
     p_mask = None
     if mask is not None:
-        patch_mask_2d = jnp.ones((B, T, num_patches, num_patches), dtype=bool) & mask[:, :, None, None]
-        p_mask = jnp.where(patch_mask_2d.reshape(bt, num_patches, num_patches)[:, None, :, :], 0.0, -1e9)
+        patch_mask_2d = jnp.ones((B, T, num_p, num_p), dtype=bool) & mask[:, :, None, None]
+        p_mask = jnp.where(patch_mask_2d.reshape(bt, num_p, num_p)[:, None, :, :], 0.0, -1e9)
 
-    patch_seq = encoded.reshape(bt, num_patches, C)
-    q_p, k_p, v_p = map(lambda k: (patch_seq @ params[k]).reshape(bt, num_patches, n_heads, head_dim).transpose(0, 2, 1, 3), ['query', 'key', 'value'])
+    patch_seq = encoded.reshape(bt, num_p, C)
+    q_p, k_p, v_p = map(lambda k: (patch_seq @ params[k]).reshape(bt, num_p, n_heads, head_dim).transpose(0, 2, 1, 3), ['query', 'key', 'value'])
     
-    attn_out_p = scaled_dot_product_attention(apply_rope(q_p), apply_rope(k_p), v_p, p_mask).transpose(0, 2, 1, 3).reshape(bt, num_patches, C)
+    attn_out_p = scaled_dot_product_attention(apply_rope(q_p), apply_rope(k_p), v_p, p_mask).transpose(0, 2, 1, 3).reshape(bt, num_p, C)
     h_p = rms_norm(attn_out_p + patch_seq, params['rms_scale_1'])
     h_p = rms_norm(h_p + jax.nn.gelu(h_p @ params['ff_1']) @ params['ff_2'], params['rms_scale_2'])
     
-    h_frames = h_p.reshape(B, T, num_patches, C)
+    h_frames = h_p.reshape(B, T, num_p, C)
     ft = jnp.mean(h_frames, axis=2) + params['t_pos_emb'][:T][None, :, :]
     q_t, k_t, v_t = map(lambda k: (ft @ params[k]).reshape(B, T, n_heads, head_dim).transpose(0, 2, 1, 3), ['t_query', 't_key', 't_value'])
     
@@ -88,14 +107,19 @@ def gpt_forward(params, x, cond, mask=None, target_dim=44100, patch_dim=441, num
     
     base_cond = (params['time_emb'][step_indices] + params['scale_emb'][jnp.clip(scale, 0, 127)][:, None, :] + (((bpm - 120.0) / 60.0)[:, None] @ params['bpm_proj'])[:, None, :] + params['stem_emb'][stem][:, None, :])[:, :, None, :]
     h_frames = h_frames + jnp.expand_dims(h_t, 2) + base_cond + sigma_t[:, :, None, None] * params['sigma_emb'][None, None, None, :]
-    return (rms_norm(jax.nn.gelu(h_frames @ params['up_proj_1']) @ params['up_proj_2'], params['out_rms_scale']) @ params['out_proj']).reshape(B, T, num_patches * patch_dim)
+    
+    out_encoded = rms_norm(jax.nn.gelu(h_frames @ params['up_proj_1']) @ params['up_proj_2'], params['out_rms_scale']) @ params['out_proj']
+    if modality_type == "audio":
+        return out_encoded.reshape(B, T, num_p * patch_dim)
+    return out_encoded
 
 xavier_normal = lambda key, shape: jax.random.normal(key, shape) * jnp.sqrt(2.0 / (shape[-2] if len(shape) >= 2 else shape[0] + shape[-1] if len(shape) >= 2 else shape[0]))
 
 def init_params(key, dim=1024, patch_dim=441, comp_dim=512, steps=50):
-    keys = jax.random.split(key, 22)
+    keys = jax.random.split(key, 23)
     return {
         'audio_encoder': xavier_normal(keys[0], (patch_dim, comp_dim)), 'down_proj_2': xavier_normal(keys[1], (comp_dim, dim)),
+        'token_encoder': xavier_normal(keys[22], (patch_dim, comp_dim)),
         'query': jax.random.orthogonal(keys[2], dim), 'key': jax.random.orthogonal(keys[3], dim), 'value': jax.random.orthogonal(keys[4], dim),
         't_query': jax.random.orthogonal(keys[5], dim), 't_key': jax.random.orthogonal(keys[6], dim), 't_value': jax.random.orthogonal(keys[7], dim),
         'ff_1': xavier_normal(keys[8], (dim, dim * 4)), 'ff_2': xavier_normal(keys[9], (dim * 4, dim)),
@@ -219,7 +243,7 @@ def run_meta_daemon():
         time.sleep(5)
 
 # -----------------------------------------------------------------------------
-# 3. Utilities & Data Pipeline (Variable-Length Windows & Full Tracks)
+# 3. Utilities & Data Pipeline
 # -----------------------------------------------------------------------------
 load_checkpoint_safely = lambda: (lambda clf: (fcntl.flock(clf, fcntl.LOCK_EX), res := (pickle.load(open(CURR_CKPT, "rb")) if os.path.exists(CURR_CKPT) else None), fcntl.flock(clf, fcntl.LOCK_UN), res)[-1])(open(CKPT_LOCK_PATH, "a+"))
 
@@ -343,10 +367,10 @@ def raw_memmap_loader(batch_size, min_seq_len=4, max_seq_len=16, samples_per_sec
                 "patches": np.stack(patches), "scale": int(entry.get("scale", 0)),
                 "bpm": float(entry.get("bpm", 120.0)), "stem": int(entry.get("stem", 0)),
                 "steps": np.array(steps_arr, dtype=np.int32), "sigmas": np.array(sigma_vals, dtype=np.float32),
-                "id": (yt_id, tw_str), "len": seq_len
+                "id": (yt_id, tw_str), "len": seq_len, "modality": "audio"
             })
             
-        batch_x, batch_scales, batch_bpms, batch_stems, batch_steps, batch_sigmas, batch_masks, batch_ids = [], [], [], [], [], [], [], []
+        batch_x, batch_scales, batch_bpms, batch_stems, batch_steps, batch_sigmas, batch_masks, batch_ids, batch_modalities = [], [], [], [], [], [], [], [], []
         for item in raw_samples:
             L = item["len"]
             pad_len = max_T - L
@@ -363,8 +387,9 @@ def raw_memmap_loader(batch_size, min_seq_len=4, max_seq_len=16, samples_per_sec
             batch_sigmas.append(padded_sigmas)
             batch_masks.append(mask)
             batch_ids.append(item["id"])
+            batch_modalities.append(item["modality"])
             
-        yield np.stack(batch_x), np.array(batch_scales, dtype=np.int32), np.array(batch_bpms, dtype=np.float32), np.array(batch_stems, dtype=np.int32), np.stack(batch_steps), np.stack(batch_sigmas), np.stack(batch_masks), batch_ids
+        yield np.stack(batch_x), np.array(batch_scales, dtype=np.int32), np.array(batch_bpms, dtype=np.float32), np.array(batch_stems, dtype=np.int32), np.stack(batch_steps), np.stack(batch_sigmas), np.stack(batch_masks), batch_ids, batch_modalities
 
 def run_single_track_worker(worker_idx, initial_params):
     optimizer = optax.adam(1e-4)
@@ -379,7 +404,7 @@ def run_single_track_worker(worker_idx, initial_params):
         stems = np.array([stem], dtype=np.int32)
         cond = (scales, bpms, stems, steps, sigmas)
         
-        loss_val, grads = jax.value_and_grad(lambda p: combined_audio_loss(gpt_forward(p, jnp.cos(sigmas * np.pi / 2.0)[:, :, None] * track_data + jnp.sin(sigmas * np.pi / 2.0)[:, :, None] * jax.random.normal(jax.random.PRNGKey(step), track_data.shape), cond), jax.random.normal(jax.random.PRNGKey(step), track_data.shape)))(params)
+        loss_val, grads = jax.value_and_grad(lambda p: combined_audio_loss(gpt_forward(p, jnp.cos(sigmas * np.pi / 2.0)[:, :, None] * track_data + jnp.sin(sigmas * np.pi / 2.0)[:, :, None] * jax.random.normal(jax.random.PRNGKey(step), track_data.shape), cond, modality_type="audio"), jax.random.normal(jax.random.PRNGKey(step), track_data.shape)))(params)
         
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -391,22 +416,41 @@ def run_single_track_worker(worker_idx, initial_params):
 # 4. Main Execution & Integration Interface
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Multimodal JAX Diffusion Transformer Trainer")
+    parser.add_argument("--train", action="store_true", help="Launch the training daemon")
+    parser.add_argument("--ckpt-mix", type=str, default="checkpoints/checkpoint_bundle.pickle", 
+                        help="Comma-separated list of checkpoint bundles to mix/load")
+    args = parser.parse_args()
+
     os.makedirs("data", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("checkpoints/ntk", exist_ok=True)
     os.makedirs("ntk_logs", exist_ok=True)
     
     optimizer = optax.adam(1e-4)
+    ckpt_paths = [p.strip() for p in args.ckpt_mix.split(",")]
+    primary_ckpt = ckpt_paths[0]
     
-    if not os.path.exists(CURR_CKPT):
+    if not os.path.exists(primary_ckpt):
         init_seed = get_or_create_init_seed(42)
         init_p = init_params(jax.random.PRNGKey(init_seed))
-        pickle.dump({"params": init_p, "ema_params": init_p, "opt_state": optimizer.init(init_p), "version": 0, "global_step": 0}, open(CURR_CKPT, "wb"))
+        pickle.dump({"params": init_p, "ema_params": init_p, "opt_state": optimizer.init(init_p), "version": 0, "global_step": 0}, open(primary_ckpt, "wb"))
 
-    bundle = load_checkpoint_safely()
-    params, ema_params, version, global_step = bundle["params"], bundle.get("ema_params", bundle["params"]), bundle.get("version", 0), bundle.get("global_step", 0)
+    bundle = _load_params_from_bundle(primary_ckpt) if isinstance(_load_params_from_bundle(primary_ckpt), dict) else load_checkpoint_safely()
+    params = bundle["params"] if isinstance(bundle, dict) and "params" in bundle else bundle
 
-    if "--train" in sys.argv:
+    if len(ckpt_paths) > 1:
+        print(f"[Trainer] Blending checkpoint mix from paths: {ckpt_paths}")
+        for alt_path in ckpt_paths[1:]:
+            if os.path.exists(alt_path):
+                alt_p = _load_params_from_bundle(alt_path)
+                params = jax.tree_util.tree_map(lambda p1, p2: 0.5 * p1 + 0.5 * p2, params, alt_p)
+
+    ema_params = bundle.get("ema_params", params) if isinstance(bundle, dict) else params
+    version = bundle.get("version", 0) if isinstance(bundle, dict) else 0
+    global_step = bundle.get("global_step", 0) if isinstance(bundle, dict) else 0
+
+    if args.train:
         single_track_params_results = [None] * CONCURRENT_MODELS
         def spawn_worker(w_idx, init_p):
             single_track_params_results[w_idx] = run_single_track_worker(w_idx, init_p)
@@ -416,15 +460,17 @@ if __name__ == "__main__":
 
         threading.Thread(target=run_meta_daemon, daemon=True).start()
 
-        print(f"[Trainer] Launching integrated training loop at global step {global_step} (Version {version}).")
+        print(f"[Trainer] Launching integrated multimodal training loop at global step {global_step} (Version {version}).")
         loader = raw_memmap_loader(batch_size=8, min_seq_len=4, max_seq_len=16, samples_per_sec=44100, num_diffusion_steps=50)
         try:
             for batch_data in loader:
-                batch_x, scales, bpms, stems, steps, sigmas, masks, batch_ids = batch_data
+                batch_x, scales, bpms, stems, steps, sigmas, masks, batch_ids, batch_modalities = batch_data
                 cond = (scales, bpms, stems, steps, sigmas)
-                loss_val, grads = jax.value_and_grad(lambda p: combined_audio_loss(gpt_forward(p, jnp.cos(sigmas * np.pi / 2.0)[:, :, None] * batch_x + jnp.sin(sigmas * np.pi / 2.0)[:, :, None] * jax.random.normal(jax.random.PRNGKey(0), batch_x.shape), cond, masks), jax.random.normal(jax.random.PRNGKey(0), batch_x.shape), masks))(params)
+                modality_type = batch_modalities[0] if batch_modalities else "audio"
+
+                loss_val, grads = jax.value_and_grad(lambda p: combined_audio_loss(gpt_forward(p, jnp.cos(sigmas * np.pi / 2.0)[:, :, None] * batch_x + jnp.sin(sigmas * np.pi / 2.0)[:, :, None] * jax.random.normal(jax.random.PRNGKey(0), batch_x.shape), cond, masks, modality_type=modality_type), jax.random.normal(jax.random.PRNGKey(0), batch_x.shape), masks))(params)
                 
-                print(f"\n[Trainer] Step {global_step:04d} | Batch Loss: {float(loss_val):.4f} | Real Loss (0-1): {1.0/(1.0+float(loss_val)):.4f} | Version: {version}")
+                print(f"\n[Trainer] Step {global_step:04d} | Modality: {modality_type} | Batch Loss: {float(loss_val):.4f} | Real Loss (0-1): {1.0/(1.0+float(loss_val)):.4f} | Version: {version}")
 
                 preconditioned_grads = get_meta_preconditioner(grads, loss_val)
                 if preconditioned_grads is not None:
@@ -432,7 +478,7 @@ if __name__ == "__main__":
                     print("  -> [Meta] Gradients successfully preconditioned by spectral MLP.")
                 
                 if global_step % 10 == 0:
-                    ntk = compute_empirical_ntk(params, batch_x, scales, bpms, stems, steps, sigmas, masks)
+                    ntk = compute_empirical_ntk(params, batch_x, scales, bpms, stems, steps, sigmas, masks, modality_type=modality_type)
                     print(f"  -> [NTK] Trace: {ntk['trace']:.4f} | Condition Number: {ntk['condition_number']:.4f}")
                     pickle.dump(ntk, open(f"checkpoints/ntk/ntk_step_{global_step:04d}.pickle", "wb"))
                     np.save(f"ntk_logs/ntk_step_{global_step:04d}.npy", ntk["matrix"].flatten())
