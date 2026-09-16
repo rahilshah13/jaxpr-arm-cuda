@@ -8,6 +8,7 @@ from scipy.io import wavfile
 from functools import partial, reduce
 
 from processing import raw_memmap_loader, get_full_track_data, get_cached_metadata
+from discriminator import get_latest_rlhf_reward_scaling
 
 jax.config.update("jax_default_matmul_precision", "float32")
 jax.config.update("jax_enable_x64", False)
@@ -208,7 +209,10 @@ def get_meta_preconditioner(grads, loss=None):
     flat_grads, treedef = ravel_pytree(grads)
     model = SpectralPreconditionerMLP()
     scales = model.apply(meta_params, ntk_data, target_dim=flat_grads.shape[0])
-    return treedef(flat_grads * scales)
+    
+    # Scale gradients further using RLHF scalar reward feedback from discriminator
+    rlhf_scalar = get_latest_rlhf_reward_scaling()
+    return treedef(flat_grads * scales * rlhf_scalar)
 
 @jax.jit
 def train_meta_step(params, opt_state, tx, inputs):
@@ -351,7 +355,6 @@ if __name__ == "__main__":
     ckpt_paths = [p.strip() for p in args.ckpt_mix.split(",")]
     primary_ckpt = ckpt_paths[0]
     
-    # Atomic initialization of master seed and checkpoint bundle across concurrent containers
     seed_key = get_or_create_init_seed(42)
     with open(CKPT_LOCK_PATH, "a+") as clf:
         fcntl.flock(clf, fcntl.LOCK_EX)
@@ -401,9 +404,8 @@ if __name__ == "__main__":
                 preconditioned_grads = get_meta_preconditioner(grads, loss_val)
                 if preconditioned_grads is not None:
                     grads = preconditioned_grads
-                    print("  -> [Meta] Gradients successfully preconditioned by spectral MLP.")
+                    print("  -> [Meta + RLHF] Gradients successfully preconditioned by spectral MLP and RLHF reward scales.")
                 
-                # Guard NTK calculation with an exclusive lock so only one container/instance computes it per milestone step
                 if global_step % 10 == 0:
                     ntk_pickle_path = f"checkpoints/ntk/ntk_step_{global_step:04d}.pickle"
                     with open(NTK_LOCK_PATH, "a+") as ntf:
