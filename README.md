@@ -1,10 +1,6 @@
-Generative Audio Transformer (JAX)
-
-A distributed, manifold-aware generative diffusion transformer implemented in **JAX**, featuring empirical Neural Tangent Kernel (NTK) preconditioning, concurrent multi-track single-track overfit workers, and a heterogeneous AOT compilation runtime.
+A generative diffusion transformer implemented in **JAX**, featuring empirical Neural Tangent Kernel (NTK) preconditioning, concurrent single-sample overfit workers, and a heterogeneous AOT compilation runtime.
 
 ---
-
-**Architecture Flow**
 
 ```text
 [ Shared Checkpoint Bundle & Seed Lock ]
@@ -39,7 +35,7 @@ $$\mathcal{L}_{\text{total}} = \mathbb{E}_{t, \mathbf{X}_0, \boldsymbol{\epsilon
 
 ---
 
-**Synchronized Master Parameter Blending**
+**Synchronized Master Model Parameter Blending**
 
 $$\theta_{t+1} = (1 - \eta)\left(\theta_t - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t)\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
 
@@ -57,8 +53,6 @@ $$\theta_{t+1} = (1 - \eta)\left(\theta_t - \alpha \nabla \mathcal{L}_{\text{win
 
 ---
 
-**Quickstart**
-
 ```bash
 # Environment Setup & Dependencies
 brew install deno
@@ -69,11 +63,14 @@ pip3 install jax jaxlib optax numpy demucs scipy yt-dlp matplotlib
 # Run Ingestion Daemon (Watching data/urls.txt)
 python3 processing.py --ingest-daemon
 
-# Launch Synchronized Training Daemon
+# Launch Training Daemon instance
 python3 model.py --train --ckpt-mix checkpoints/checkpoint_bundle.pickle --quantization fp32
 
 # Compile AOT Runtimes & Generate Audio
 python3 inference.py --compile --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle
 python3 inference.py --generate --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle
-
 ```
+
+---
+
+- continuation of [previous work](https://github.com/rahilshah13/audio)
