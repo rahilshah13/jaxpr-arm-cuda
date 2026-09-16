@@ -1,99 +1,79 @@
-#### generative audio transformer in JAX
+Generative Audio Transformer (JAX)
 
-- continuation of work from `https://github.com/rahilshah13/audio`
-  
-
-<pre>
-[ Shared Checkpoint Bundle / Init Seed Lock ]
-                   |
-         +---------+---------+
-         |                   |
-         v                   v
-[Single-Track Workers]  [Main Training Loop] ---&gt; [Diffusion Transformer]
-         |                       |                         |
-         | (Overfit Tracks)      | (Batch Windows)         v
-         |                       v                 [Empirical NTK]
-         +------------&gt; [Master Weights] &lt;------+         |
-                                |                |         v
-                                v                |    [ntk_logs/*.npy]
-                        [Gradient Updates]       |         |
-                                |                |         v
-                                v                +--- [Meta Daemon] ---&gt; [Spectral MLP Preconditioner]
-                        [Parameter Blend]                             (Scales Gradients)
-</pre>
+A distributed, manifold-aware generative diffusion transformer implemented in **JAX**, featuring empirical Neural Tangent Kernel (NTK) preconditioning, concurrent multi-track single-track overfit workers, and a heterogeneous AOT compilation runtime.
 
 ---
 
-#### `model.py`
+**Architecture Flow**
 
+```text
+[ Shared Checkpoint Bundle & Seed Lock ]
+                   │
+         ┌─────────┴─────────┐
+         ▼                   ▼
+[Single-Track Workers]  [Main Training Loop] ──> [Diffusion Transformer]
+         │                       │                         │
+         │ (Overfit Tracks)      │ (Batch Windows)         ▼
+         │                       v                 [Empirical NTK]
+         └───────────> [Master Weights] <──────+           │
+                               │               │           ▼
+                               ▼               │    [ntk_logs/*.npy]
+                       [Gradient Updates]      │           │
+                               │               │           ▼
+                               ▼               +─── [Meta Daemon] ───> [Spectral MLP Preconditioner]
+                       [Parameter Blend]                               (Scales Gradients)
 
-
-$$ \mathcal{L}_{\text{total}} = \min_{\theta} \mathbb{E}_{t, \mathbf{X}_0, \boldsymbol{\epsilon}, \mathbf{c}} \left[ \left\| \epsilon_\theta \left( \boldsymbol{\alpha}_t \odot \mathbf{X}_0 + \boldsymbol{\sigma}_t \odot \boldsymbol{\epsilon}, t, \mathbf{c} \right) - \boldsymbol{\epsilon} \right\|^2 + \lambda \left( \left\| \text{STFT}(\mathbf{X}_0) - \text{STFT}(\hat{\mathbf{X}}_0) \right\|_1 + \left\| \mathbf{X}_0 - \hat{\mathbf{X}}_0 \right\|_1 \right) \right] $$
-
-* $\theta$: Learnable weights of the hierarchical transformer network (`gpt_forward`).
-* $\mathbf{X}_0 \in \mathbb{R}^{B \times T \times L}$: Clean batch tensor of multi-channel audio frames.
-* $\boldsymbol{\epsilon}$: Batch tensor of independent standard Gaussian noise samples.
-* $t$: Batch diffusion time step indices.
-* $\mathbf{c}$: Packed batch conditioning tuple containing scales, tempos, and stem identifiers.
-* $\boldsymbol{\alpha}_t, \boldsymbol{\sigma}_t$: Broadcasted noise schedule signal and noise multiplier tensors.
-* $\mathbf{X}_t$: Noisy batch latent tensor at diffusion step $t$.
-* $\epsilon_\theta(\mathbf{X}_t, t, \mathbf{c})$: Predicted noise tensor.
-* $\hat{\mathbf{X}}_0$: Reconstructed clean audio batch latent.
-* $\lambda$: Weighting coefficient balancing reconstruction penalties.
-* $\text{STFT}(\cdot)$: Short-Time Fourier Transform.
-
----
-
-
-* `rms_norm`: Root Mean Square normalization across feature dimensions.
-* `apply_rope`: Rotary Position Embeddings for queries and keys.
-* `scaled_dot_product_attention`: Multi-head attention with optional causal masks.
-* `clamp_frobenius_norm`: Projects tensor weights to a Frobenius norm limit of one.
-* `combined_audio_loss`: Hybrid STFT, log-spectral, and L1 waveform objective.
-* `compute_empirical_ntk`: Evaluates the empirical Neural Tangent Kernel via VJP Jacobians.
-* `gpt_forward`: Hierarchical transformer diffusion block processing multi-channel stems and discrete metadata.
-* `xavier_normal`: Xavier normal weight initialization.
-* `init_params`: Constructs model weight parameters.
-* `get_cached_metadata`: Reads JSON metadata vault records.
-* `raw_memmap_loader`: Yields memory-mapped batch tensors and conditioning tuples.
-* `load_checkpoint_safely`: Loads checkpoint bundles using file locks.
-* `push_and_pull_gradients`: Coordinates distributed gradient accumulation.
-
+```
 
 ---
 
+**Hybrid Diffusion & Reconstruction Objective**
 
-$$\theta_{t+1}^{(M)} = (1 - \eta)\left(\theta_t^{(M)} - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t^{(M)})\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
+$$\mathcal{L}_{\text{total}} = \mathbb{E}_{t, \mathbf{X}_0, \boldsymbol{\epsilon}, \mathbf{c}} \left[ \left\Vert{} \boldsymbol{\epsilon}_\theta(\mathbf{X}_t, t, \mathbf{c}) - \boldsymbol{\epsilon} \right\Vert{}^2 + \lambda \left( \left\Vert{} \text{STFT}(\mathbf{X}_0) - \text{STFT}(\hat{\mathbf{X}}_0) \right\Vert{}_1 + \left\Vert{} \mathbf{X}_0 - \hat{\mathbf{X}}_0 \right\Vert{}_1 \right) \right]$$
 
-
-* $\theta_t^{(M)}$: The parameter state of the master model at global step $t$.
-* $\eta$: The global parameter reconciliation blending weight (allocated across the concurrent single-track models).
-* $\alpha$: The optimizer learning rate for the master model.
-* $\mathcal{L}_{\text{window}}$: The combined audio loss evaluated on randomly sampled short audio windows.
-* $K$: The total number of concurrent single-track models ($CONCURRENT\_MODELS$).
-* $w_k$: The normalized proportional weight assigned to the $k$-th single-track model ($w_k = \frac{1}{K}$).
-* $\theta_{k, \text{conv}}$: The fully converged parameter state of the $k$-th concurrent model trained to zero loss on a full audio track.
+* $\theta$: Learnable parameter set of the hierarchical diffusion transformer (`gpt_forward`).
+* $\mathbf{X}_0 \in \mathbb{R}^{B \times T \times L}$: Multi-channel clean audio frame batch tensor.
+* $\mathbf{X}_t = \boldsymbol{\alpha}_t \odot \mathbf{X}_0 + \boldsymbol{\sigma}_t \odot \boldsymbol{\epsilon}$: Noisy latent state at diffusion step $t$.
+* $\mathbf{c}$: Packed conditioning tuple (scales, tempos, stem indices).
+* $\lambda$: Objective weighting coefficient balancing spectral and L1 time-domain reconstruction penalties.
 
 ---
 
-#### `inference.py`
+**Synchronized Master Parameter Blending**
 
-* `float_to_hex_halves`: Converts floats into 16-bit halves for assembly instructions.
-* `compile_closed_jaxpr_to_arm64`: Translates JAX expressions into ARM64 assembly.
-* `compile_closed_jaxpr_to_cuda`: Generates NVIDIA CUDA C execution kernels.
-* `HeterogeneousRuntime`: Manages multithreaded CPU and GPU binary execution.
+$$\theta_{t+1} = (1 - \eta)\left(\theta_t - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t)\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
+
+* $\theta_t$: Master parameter state at global step $t$.
+* $\eta$: Global parameter reconciliation blending ratio.
+* $K$: Number of concurrent single-track convergence workers ($CONCURRENT\_MODELS$).
+* $w_k$: Proportional weight for worker $k$ ($w_k = K^{-1}$).
+* $\theta_{k, \text{conv}}$: Fully converged parameter state of worker $k$ trained to zero loss on a full audio track.
 
 ---
+
+* `model.py`: Implements the hierarchical diffusion transformer, multi-head attention blocks, Rotary Position Embeddings, and the empirical NTK spectral preconditioning daemon.
+* `processing.py`: Manages the background vault ingestion daemon via file-locked polling of URLs, Demucs stem separation, and quantization-aware memory-mapped loading.
+* `inference.py`: Translates JAX expressions into optimized ARM64 NEON assembly kernels and NVIDIA CUDA C runtime binaries for concurrent heterogeneous execution.
+
+---
+
+**Quickstart**
 
 ```bash
-brew install deno;python3 venv .venv;source ./.venv/bin/activate;pip3 install jax jaxlib optax numpy demucs scipy
-python3 processing.py
-python3 model.py
-python3 inference.py --compile --seconds 10
-python3 inference.py --generate --seconds 10
+# Environment Setup & Dependencies
+brew install deno
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install jax jaxlib optax numpy demucs scipy yt-dlp matplotlib
+
+# Run Ingestion Daemon (Watching data/urls.txt)
+python3 processing.py --ingest-daemon
+
+# Launch Synchronized Training Daemon
+python3 model.py --train --ckpt-mix checkpoints/checkpoint_bundle.pickle --quantization fp32
+
+# Compile AOT Runtimes & Generate Audio
+python3 inference.py --compile --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle
+python3 inference.py --generate --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle
+
 ```
----
-
-
-
-
