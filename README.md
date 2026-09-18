@@ -3,22 +3,28 @@ A generative diffusion transformer implemented in **JAX**, featuring empirical N
 ---
 
 ```text
-[ Shared Checkpoint Bundle & Seed Lock ]
-                   │
-         ┌─────────┴─────────┐
-         ▼                   ▼
-[Single-Track Tasks]  [Main Training Loop] ──> [Diffusion Transformer]
-         │                       │                         │
-         │ (Overfit)             │ (Batch Windows)         ▼
-         │                       v                 [Empirical NTK]
-         └───────────> [Main Weights] <──────+             │
-                               │               │           ▼
-                               ▼               │    [ntk_logs/*.npy]
-                       [Gradient Updates]      │           │
-                               │               │           ▼
-                               ▼               +─── [Meta Daemon] ───> [Spectral MLP Preconditioner]
-                       [Parameter Blend]                               (Scales Gradients + RLHF)
-
+[ Shared Checkpoint Bundle ]
+          │
+          ▼
+[ Batched Random Windows & Single-Track Overfit ]
+          │
+          ▼
+[ Diffusion Transformer ]
+          │
+          ▼
+[ Empirical NTK ]
+          │
+          ▼
+[ Meta Spectral-Preconditioner MLP ]
+          │
+          ▼
+[ Optional RLHF Reward Scaling ]
+          │
+          ▼
+[ BATCH_N=4 Gradient Accumulation ]
+          │
+          ▼
+[ Parameter Blend & Checkpoint Sync ]
 ```
 
 ---
