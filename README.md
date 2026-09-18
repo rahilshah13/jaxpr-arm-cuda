@@ -1,4 +1,4 @@
-A generative diffusion transformer implemented in **JAX**, featuring empirical Neural Tangent Kernel (NTK) preconditioning, concurrent single-sample overfit workers, and a heterogeneous AOT compilation runtime.
+A generative diffusion transformer implemented in **JAX**, featuring empirical Neural Tangent Kernel (NTK) preconditioning, concurrent single-sample overfit, and a heterogeneous AOT compilation runtime.
 
 ---
 
@@ -7,11 +7,11 @@ A generative diffusion transformer implemented in **JAX**, featuring empirical N
                    │
          ┌─────────┴─────────┐
          ▼                   ▼
-[Single-Track Workers]  [Main Training Loop] ──> [Diffusion Transformer]
+[Single-Track Tasks]  [Main Training Loop] ──> [Diffusion Transformer]
          │                       │                         │
-         │ (Overfit Tracks)      │ (Batch Windows)         ▼
+         │ (Overfit)             │ (Batch Windows)         ▼
          │                       v                 [Empirical NTK]
-         └───────────> [Master Weights] <──────+           │
+         └───────────> [Main Weights] <──────+             │
                                │               │           ▼
                                ▼               │    [ntk_logs/*.npy]
                        [Gradient Updates]      │           │
@@ -35,7 +35,7 @@ $$\mathcal{L}_{\text{total}} = \mathbb{E}_{t, \mathbf{X}_0, \boldsymbol{\epsilon
 
 ---
 
-**Synchronized Master Model Parameter Blending**
+**Synchronized Model Parameter Blending**
 
 $$\theta_{t+1} = (1 - \eta)\left(\theta_t - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t)\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
 
