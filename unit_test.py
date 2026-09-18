@@ -1,14 +1,13 @@
+import json
+import os
+import random
 import jax
 import jax.numpy as jnp
 import numpy as np
-import random
-import subprocess
-import json
-import os
 from inference import (
-    compile_closed_jaxpr_to_arm64, 
-    compile_closed_jaxpr_to_cuda, 
-    HeterogeneousRuntime
+    compile_closed_jaxpr_to_arm64,
+    compile_closed_jaxpr_to_cuda,
+    HeterogeneousRuntime,
 )
 
 GO_VALIDATOR_CODE = """
@@ -16,40 +15,46 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"simd"
 	"strconv"
 	"strings"
 )
 
-type Literal struct {
-	Val float32
-}
-
 type Var struct {
-	Name string
+	Name string `json:"Name"`
 }
 
 type Primitive struct {
-	Name string
+	Name string `json:"Name"`
+}
+
+type InputVar struct {
+	Type string  `json:"Type"`
+	Name string  `json:"Name"`
+	Val  float32 `json:"Val"`
 }
 
 type Equation struct {
-	Primitive Primitive
-	Invars    []interface{}
-	Outvars   []Var
+	Primitive Primitive  `json:"Primitive"`
+	Invars    []InputVar `json:"Invars"`
+	Outvars   []Var      `json:"Outvars"`
 }
 
 type Jaxpr struct {
-	Invars  []Var
-	Eqns    []Equation
-	Outvars []Var
+	Invars  []Var      `json:"Invars"`
+	Eqns    []Equation `json:"Eqns"`
+	Outvars []Var      `json:"Outvars"`
 }
 
-type ClosedJaxpr struct {
-	Jaxpr Jaxpr
+type SimdVector interface {
+	Mul(SimdVector) SimdVector
+	Add(SimdVector) SimdVector
+	Sub(SimdVector) SimdVector
+	Div(SimdVector) SimdVector
+	Store([]float32)
 }
 
 func main() {
@@ -79,6 +84,20 @@ func main() {
 		sampleB[i] = float32(val)
 	}
 
+	// Load and parse jaxpr.json exported by Python
+	file, err := os.Open("jaxpr.json")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open jaxpr.json: %v\\n", err)
+		return
+	}
+	defer file.Close()
+
+	var jaxpr Jaxpr
+	if err := json.NewDecoder(file).Decode(&jaxpr); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to decode jaxpr.json: %v\\n", err)
+		return
+	}
+
 	N := len(sampleA)
 	cpuOutFlat := make([]float32, N)
 
@@ -90,13 +109,58 @@ func main() {
 
 	paddedOut := make([]float32, paddedN)
 
-	i := 0
-	for ; i <= paddedN-4; i += 4 {
-		va := simd.LoadFloat32s(aPadded[i : i+4])
-		vb := simd.LoadFloat32s(bPadded[i : i+4])
-		// Matches the 50-depth evaluation pipeline: (x * y) + x - (y / 1.1)
-		res := va.Mul(vb).Add(va).Sub(vb.Div(simd.BroadcastFloat32s(1.1)))
-		res.Store(paddedOut[i : i+4])
+	for i := 0; i <= paddedN-4; i += 4 {
+		env := make(map[string]SimdVector)
+		if len(jaxpr.Invars) >= 2 {
+			env[jaxpr.Invars[0].Name] = simd.LoadFloat32s(aPadded[i : i+4])
+			env[jaxpr.Invars[1].Name] = simd.LoadFloat32s(bPadded[i : i+4])
+		}
+
+		for _, eqn := range jaxpr.Eqns {
+			var v1, v2 SimdVector
+
+			if len(eqn.Invars) > 0 {
+				if eqn.Invars[0].Type == "Literal" {
+					v1 = simd.BroadcastFloat32s(eqn.Invars[0].Val)
+				} else {
+					v1 = env[eqn.Invars[0].Name]
+				}
+			}
+
+			if len(eqn.Invars) > 1 {
+				if eqn.Invars[1].Type == "Literal" {
+					v2 = simd.BroadcastFloat32s(eqn.Invars[1].Val)
+				} else {
+					v2 = env[eqn.Invars[1].Name]
+				}
+			}
+
+			var res SimdVector
+			prim := strings.ToLower(eqn.Primitive.Name)
+			switch prim {
+			case "mul", "mul_f32":
+				res = v1.Mul(v2)
+			case "add", "add_f32":
+				res = v1.Add(v2)
+			case "sub", "sub_f32":
+				res = v1.Sub(v2)
+			case "div", "div_f32":
+				res = v1.Div(v2)
+			default:
+				res = v1
+			}
+
+			if len(eqn.Outvars) > 0 {
+				env[eqn.Outvars[0].Name] = res
+			}
+		}
+
+		if len(jaxpr.Outvars) > 0 {
+			finalVar := jaxpr.Outvars[0].Name
+			if finalVec, ok := env[finalVar]; ok {
+				finalVec.Store(paddedOut[i : i+4])
+			}
+		}
 	}
 	copy(cpuOutFlat, paddedOut[:N])
 
@@ -112,10 +176,11 @@ func main() {
 """
 
 def get_random_function(depth=50):
+    random.seed(42)
     ops = [lambda x, y: x + y, lambda x, y: x - y, lambda x, y: x * y, lambda x, y: x / 1.1]
     def fn(x, y):
         val = x
-        for i in range(depth):
+        for _ in range(depth):
             op = random.choice(ops)
             val = op(val, y)
         return val
@@ -184,9 +249,9 @@ def main():
     runtime.compile_and_load()
     
     cpu_res, gpu_res = runtime.execute_concurrently(np.array(data_x), np.array(data_y))
+	go_res = run_go_validator(np.array(data_x), np.array(data_y))
     expected = random_math(data_x, data_y)
     
-    go_res = run_go_validator(np.array(data_x), np.array(data_y))
 
     print(f"\n[Unit Test] Graph Depth: {depth}")
     print("  -> ARM64 NEON Output Match  :", np.allclose(cpu_res, expected, atol=1e-3))
