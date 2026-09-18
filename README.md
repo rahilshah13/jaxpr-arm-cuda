@@ -41,7 +41,7 @@ $$\mathcal{L}_{\text{total}} = \mathbb{E}_{t, \mathbf{X}_0, \boldsymbol{\epsilon
 
 ---
 
-**Synchronized Model **
+**Synchronized Model**
 
 $$\theta_{t+1} = (1 - \eta)\left(\theta_t - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t)\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
 
