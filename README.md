@@ -1,4 +1,4 @@
-A generative diffusion transformer implemented in **JAX**, featuring empirical Neural Tangent Kernel (NTK) preconditioning, concurrent single-sample overfit, and a heterogeneous AOT compilation runtime.
+Generative diffusion transformer implemented in **JAX**, featuring empirical Neural Tangent Kernel (NTK) preconditioning, concurrent single-sample overfit, and heterogeneous AOT compilation.
 
 ---
 
@@ -41,7 +41,7 @@ $$\mathcal{L}_{\text{total}} = \mathbb{E}_{t, \mathbf{X}_0, \boldsymbol{\epsilon
 
 ---
 
-**Synchronized Model Parameter Blending**
+**Synchronized Model **
 
 $$\theta_{t+1} = (1 - \eta)\left(\theta_t - \alpha \nabla \mathcal{L}_{\text{window}}(\theta_t)\right) + \eta \sum_{k=1}^{K} w_k \theta_{k, \text{conv}}$$
 
@@ -50,14 +50,6 @@ $$\theta_{t+1} = (1 - \eta)\left(\theta_t - \alpha \nabla \mathcal{L}_{\text{win
 * $K$: Number of concurrent single-track convergence workers ($CONCURRENT\_MODELS$).
 * $w_k$: Proportional weight for worker $k$ ($w_k = K^{-1}$).
 * $\theta_{k, \text{conv}}$: Fully converged parameter state of worker $k$ trained to zero loss on a full audio track.
-
----
-
-* `model.py`: Implements the hierarchical diffusion transformer, multi-head attention blocks, Rotary Position Embeddings, and the empirical NTK/RLHF spectral preconditioning daemon.
-* `processing.py`: Manages the background vault ingestion daemon via file-locked polling of URLs, Demucs stem separation, and quantization-aware memory-mapped loading.
-* `inference.py`: Translates JAX expressions into optimized ARM64 NEON assembly kernels and NVIDIA CUDA C runtime binaries for concurrent heterogeneous execution.
-* `discriminator.py`: Manages 0–10 sample grading for human feedback (RLHF) to dynamically weight gradient updates.
-* `main.py`: Container orchestrator hosting the FastAPI backend and reactive SolidJS/Tailwind command center dashboard over WebSockets.
 
 ---
 
@@ -74,4 +66,4 @@ python3 discriminator.py
 
 ---
 
-* continuation of [previous work](https://github.com/rahilshah13/audio)
+* [continuation](https://github.com/rahilshah13/audio)
