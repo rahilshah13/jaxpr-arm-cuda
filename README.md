@@ -1,7 +1,3 @@
-Generative diffusion transformer implemented in **JAX**, featuring empirical Neural Tangent Kernel (NTK) preconditioning, concurrent single-sample overfit, and heterogeneous AOT compilation.
-
----
-
 ```text
 [ Shared Checkpoint Bundle ]
           │
