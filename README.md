@@ -61,6 +61,13 @@ python3 discriminator.py
 ```
 
 ---
+### `unit_test.py` is a test harness designed to compile, execute, and benchmark JAXPR computational graphs across multiple hardware-specific SIMD and accelerator backends.
+* **Python-JAX**: Serves as the numerical baseline reference engine.
+* **Custom ARM64 SIMD**: Hand-rolled assembly kernel generator leveraging NEON vector registers (`v0.4s`–`v31.4s`) with dynamic register spilling and stack offset management.
+* **Go ARM64 SIMD**: Portable SIMD execution engine leveraging Go's experimental `simd` package (`GOEXPERIMENT=simd`) with robust token stream parsing to validate full transformer graphs (`--gpt`).
+* **NVIDIA CUDA**: Dynamic C++/CUDA source generation and shared object compilation (`libnvidia.so`) for parallel GPU execution.
+
+
 #### `python3 unit_test.py` (random graph of depth=100000)
 <img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/2a595e89-34dc-4226-88b4-7362de1e6ee2" />
 
