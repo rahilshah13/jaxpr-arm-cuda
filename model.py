@@ -210,7 +210,6 @@ def get_meta_preconditioner(grads, loss=None):
     model = SpectralPreconditionerMLP()
     scales = model.apply(meta_params, ntk_data, target_dim=flat_grads.shape[0])
     
-    # Scale gradients further using RLHF scalar reward feedback from discriminator
     rlhf_scalar = get_latest_rlhf_reward_scaling()
     return treedef(flat_grads * scales * rlhf_scalar)
 
@@ -260,7 +259,7 @@ def run_meta_daemon():
         time.sleep(5)
 
 # -----------------------------------------------------------------------------
-# 3. Synchronized Checkpoint & Gradient Utilities
+# 3. Synchronized Checkpoint & Gradient Utilities & JAXPR Export
 # -----------------------------------------------------------------------------
 load_checkpoint_safely = lambda: (lambda clf: (fcntl.flock(clf, fcntl.LOCK_EX), res := (pickle.load(open(CURR_CKPT, "rb")) if os.path.exists(CURR_CKPT) else None), fcntl.flock(clf, fcntl.LOCK_UN), res)[-1])(open(CKPT_LOCK_PATH, "a+"))
 
@@ -334,17 +333,72 @@ def run_single_track_worker(worker_idx, initial_params, quantization="fp32"):
         step += 1
     return params
 
+def export_model_jaxpr_to_json(filepath="jaxpr.json"):
+    params = init_params(jax.random.PRNGKey(0))
+    batch_x = jnp.ones((2, 4, 44100), dtype=jnp.float32)
+    sigmas = jnp.ones((2, 4), dtype=jnp.float32)
+    scales = jnp.zeros((2,), dtype=jnp.int32)
+    bpms = jnp.full((2,), 120.0, dtype=jnp.float32)
+    stems = jnp.zeros((2,), dtype=jnp.int32)
+    steps = jnp.zeros((2, 4), dtype=jnp.int32)
+    masks = jnp.ones((2, 4), dtype=bool)
+    
+    def trace_fn(x):
+        cond = (scales, bpms, stems, steps, sigmas)
+        return gpt_forward(params, x, cond, masks, modality_type="audio")
+
+    closed_jaxpr = jax.make_jaxpr(trace_fn)(batch_x)
+    jaxpr = closed_jaxpr.jaxpr
+
+    def serialize_var(v):
+        if hasattr(v, "name"):
+            return {"Name": v.name}
+        elif hasattr(v, "suffix"):
+            return {"Name": f"v{v.suffix}"}
+        else:
+            return {"Name": str(v)}
+        
+    def serialize_invar(inv):
+        if type(inv).__name__ == "Literal" or hasattr(inv, "val"):
+            return {"Type": "Literal", "Val": float(inv.val)}
+        else:
+            name = inv.name if hasattr(inv, "name") else (f"v{inv.suffix}" if hasattr(inv, "suffix") else str(inv))
+            return {"Type": "Var", "Name": name}
+
+    eqns = []
+    for eqn in jaxpr.eqns:
+        eqns.append({
+            "Primitive": {"Name": eqn.primitive.name},
+            "Invars": [serialize_invar(inv) for inv in eqn.invars],
+            "Outvars": [serialize_var(out) for out in eqn.outvars]
+        })
+
+    data = {
+        "Invars": [serialize_var(v) for v in jaxpr.invars],
+        "Eqns": eqns,
+        "Outvars": [serialize_var(v) for v in jaxpr.outvars]
+    }
+    
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"[Model] Successfully exported model jaxpr to {filepath}")
+
 # -----------------------------------------------------------------------------
 # 4. Main Execution & Synchronized Daemon Interface
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Synchronized Multimodal JAX Diffusion Transformer Daemon")
     parser.add_argument("--train", action="store_true", help="Launch the synchronized training daemon loop")
+    parser.add_argument("--export-jaxpr", action="store_true", help="Export model forward pass JAXPR to jaxpr.json for unit test harness")
     parser.add_argument("--ckpt-mix", type=str, default="checkpoints/checkpoint_bundle.pickle", 
                         help="Comma-separated list of checkpoint bundles to mix/load")
     parser.add_argument("--quantization", type=str, default="fp32", choices=["fp32", "fp16", "int8", "int4"],
                         help="Data ingestion quantization fidelity tier")
     args = parser.parse_args()
+
+    if args.export_jaxpr:
+        export_model_jaxpr_to_json("jaxpr.json")
+        sys.exit(0)
 
     os.makedirs("data", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
