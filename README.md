@@ -61,5 +61,25 @@ python3 discriminator.py
 ```
 
 ---
+#### `python3 unit_test.py` (random graph of depth=100000)
+<img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/2a595e89-34dc-4226-88b4-7362de1e6ee2" />
+
+
+
+<img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/3f94dbb3-570d-4319-be7a-0b7f71eea97b" />
+
+
+<img width="3600" height="3600" alt="image" src="https://github.com/user-attachments/assets/26fd809f-cad6-42a8-a0b4-f8007774cfaf" />
+
+---
+#### `python3 unit_test.py --gpt` (exported jaxpr from model.py)
+<img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/d814bbf5-3358-48db-8512-1c08fad152bc" />
+
+<img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/085aa32a-8003-4c87-bb63-59ee8c5d1e99" />
+
+<img width="3600" height="3600" alt="image" src="https://github.com/user-attachments/assets/dbb45ee0-acfb-44cb-a808-98ef0c70e848" />
+
+
+--- 
 
 * [continuation](https://github.com/rahilshah13/audio)
