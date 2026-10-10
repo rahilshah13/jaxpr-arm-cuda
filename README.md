@@ -68,9 +68,6 @@ python3 discriminator.py
 - **Go ARM64 SIMD**: Portable SIMD execution engine leveraging Go's experimental `simd` package (`GOEXPERIMENT=simd`) with robust token stream parsing to validate full transformer graphs (`--gpt`).
 - **NVIDIA CUDA**: Dynamic C++/CUDA source generation and shared object compilation (`libnvidia.so`) for parallel GPU execution.
 
-
-The empirical data across your benchmarking artifacts (`backend_benchmark.png`, `kernel_complexity_analysis.png`, and `trajectory_and_error_analysis_2.jpg`) delivers a clear technical narrative about compiling high-level JAX computational graphs into bare-metal SIMD targets.
-
 ### 1. Runtime Performance & Latency (`backend_benchmark.png`)
 
 * **Custom ARM64 SIMD (5.681 ms | ~13.7x Speedup)**: By generating hand-rolled AArch64 assembly that maps directly to hardware NEON vector registers (`v0.4s`–`v31.4s`) with active register allocation and minimal stack spilling, the custom backend executes the 367-equation transformer graph at near-metal speed.
