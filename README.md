@@ -83,7 +83,6 @@ python3 discriminator.py
 
 <img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/085aa32a-8003-4c87-bb63-59ee8c5d1e99" />
 
-<img width="3600" height="3600" alt="image" src="https://github.com/user-attachments/assets/dbb45ee0-acfb-44cb-a808-98ef0c70e848" />
 
 
 --- 
