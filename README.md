@@ -61,18 +61,18 @@ python3 discriminator.py
 ```
 
 ---
-#### `unit_test.py`
+### `unit_test.py` (work in progress)
 - test harness to compile, execute, and benchmark JAXPR computational graphs across 4 backends:
 - **Python-JAX**: baseline/reference engine
 - **Custom ARM64 SIMD**: ""Gemini-rolled"" assembly kernel generator leveraging NEON vector registers (`v0.4s`–`v31.4s`) with dynamic register spilling and stack offset management.
-- **Go ARM64 SIMD**: Portable SIMD execution engine leveraging Go's experimental `simd` package (`GOEXPERIMENT=simd`) with robust token stream parsing to validate full transformer graphs (`--gpt`).
-- **NVIDIA CUDA**: Dynamic C++/CUDA source generation and shared object compilation (`libnvidia.so`) for parallel GPU execution.
+- **Go ARM64 SIMD**: Leverages Go 1.27.2's experimental `simd` package (`GOEXPERIMENT=simd`)
+- **NVIDIA CUDA**: Dynamic C++/CUDA source generation and shared object compilation (`libnvidia.so`)
 
-### `python3 unit_test.py` (random graph, depth=100000)
+#### `python3 unit_test.py` (random graph, depth=100000)
 <img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/2a595e89-34dc-4226-88b4-7362de1e6ee2" />
 
 ---
-### `python3 unit_test.py --gpt` (jaxpr from model.py)
+#### `python3 unit_test.py --gpt` (jaxpr from model.py)
 <img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/d814bbf5-3358-48db-8512-1c08fad152bc" />
 
 <img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/085aa32a-8003-4c87-bb63-59ee8c5d1e99" />
