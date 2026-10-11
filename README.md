@@ -76,7 +76,6 @@ python3 discriminator.py
 <img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/3f94dbb3-570d-4319-be7a-0b7f71eea97b" />
 
 
-<img width="3600" height="3600" alt="image" src="https://github.com/user-attachments/assets/26fd809f-cad6-42a8-a0b4-f8007774cfaf" />
 
 ---
 ### `python3 unit_test.py --gpt` (exported jaxpr from model.py)
