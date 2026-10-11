@@ -68,32 +68,6 @@ python3 discriminator.py
 - **Go ARM64 SIMD**: Portable SIMD execution engine leveraging Go's experimental `simd` package (`GOEXPERIMENT=simd`) with robust token stream parsing to validate full transformer graphs (`--gpt`).
 - **NVIDIA CUDA**: Dynamic C++/CUDA source generation and shared object compilation (`libnvidia.so`) for parallel GPU execution.
 
-### 1. Runtime Performance & Latency (`backend_benchmark.png`)
-
-* **Custom ARM64 SIMD (5.681 ms | ~13.7x Speedup)**: By generating hand-rolled AArch64 assembly that maps directly to hardware NEON vector registers (`v0.4s`–`v31.4s`) with active register allocation and minimal stack spilling, the custom backend executes the 367-equation transformer graph at near-metal speed.
-* **Python-JAX (77.915 ms | Baseline)**: Reflects the standard framework interpretation overhead, dynamic dispatch, and Python interpreter interaction costs.
-* **Go ARM64 SIMD (377.069 ms | ~0.2x Speedup)**: While utilizing Go's experimental vector package (`GOEXPERIMENT=simd`), the interpreted validator loop processes token-parsed input payloads and maps operations through software/runtime abstraction layers. Because the benchmark script measures the end-to-end subprocess startup, stream reading, string tokenization, and interpreter dispatch overhead inside a single loop iteration rather than a persistent C-binding entry point, it exhibits higher latency for this schema.
-
-
-
-### 2. Binary Footprint & Kolmogorov Complexity (`kernel_complexity_analysis.png`)
-
-* **Custom ARM64 SIMD (`libarm.so`)**: Exhibits an extremely compact binary footprint (tens of kilobytes) because it compiles directly down to dense, highly regular instruction loops without heavy runtime overhead.
-* **Go ARM64 SIMD (`go_validator_bin`)**: Shows a significantly larger raw binary size (~2.6 MB) and compressed Kolmogorov footprint (~1.1 MB). This is driven by Go's statically linked runtime, garbage collector, reflection metadata, and the experimental vector package runtime components bundled into the standalone executable.
-
-
-
-### 3. Verification & Precision Parity (`trajectory_and_error_analysis_2.jpg`)
-
-* **Top Panel (Register Pressure)**: Shows that the transformer graph execution stays well within hardware limits (peaking at 7 out of 24 available ARM vector registers) with zero critical register spills.
-
-
-* **Middle Panel (Error Envelope)**: Confirms absolute numerical alignment across targets, with the measured absolute error envelope remaining strictly bounded at float32 precision limits relative to JAX.
-
-
-* **Bottom Panel (Parameter Magnitude Profiles)**: Demonstrates that the multi-target L2 weight norms across all sub-modules (`audio_encoder`, `down_proj_2`, `ff_1`, etc.) match identically across Python-JAX, Custom ARM, and Go targets, confirming complete precision parity.
-
-
 ### `python3 unit_test.py` (random graph of depth=100000)
 <img width="3000" height="1800" alt="image" src="https://github.com/user-attachments/assets/2a595e89-34dc-4226-88b4-7362de1e6ee2" />
 
