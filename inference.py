@@ -1,415 +1,116 @@
 """
-This module integrates inference, AOT compilation hooks, and generative sampling
-with the consolidated multimodal model backend (model.py) and processing pipeline (processing.py).
-
-Usage:
     python3 inference.py --compile --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle --quantization fp32
     python3 inference.py --generate --seconds 10 --ckpt-mix checkpoints/checkpoint_bundle.pickle --quantization fp32
 """
 
-import jax
-import jax.numpy as jnp
-import struct
-import subprocess
-import ctypes
-import threading
-import numpy as np
-import os
-import sys
-import pickle
-import time
 import argparse
-from scipy.io import wavfile
+import os
+import pickle
+import sys
+import time
 from functools import partial
 
+import jax
+import jax.numpy as jnp
+import numpy as np
+from scipy.io import wavfile
+
 # Import directly from the model and processing modules
-from model import init_params, gpt_forward, load_checkpoint_safely, _load_params_from_bundle
+from model import (
+    _load_params_from_bundle,
+    gpt_forward,
+    init_params,
+    load_checkpoint_safely,
+)
 from processing import apply_quantization_tier
 
 
-def float_to_hex_halves(f_val):
-    uint32_val = struct.unpack('<I', struct.pack('<f', float(f_val)))[0]
-    return uint32_val & 0xFFFF, (uint32_val >> 16) & 0xFFFF
+class JaxprInferenceEngine:
+    """Manages JAXPR tracing, inspection, and JIT-compiled inference execution."""
 
+    def __init__(self, params):
+        self.params = params
+        # JIT-compile the forward pass using JAX XLA
+        self.jit_forward = jax.jit(
+            partial(gpt_forward, self.params, modality_type="audio")
+        )
 
-def compile_closed_jaxpr_to_arm64(closed_jaxpr):
-    jaxpr = closed_jaxpr.jaxpr
-    sym_name = "_jax_arm64_simd_kernel" if sys.platform == "darwin" else "jax_arm64_simd_kernel"
-    
-    asm = [
-        ".text",
-        ".align 4",
-        f".global {sym_name}",
-        f"{sym_name}:",
-        "    sub sp, sp, #128",
-        "    stp x29, x30, [sp, #96]",
-        "    mov x29, sp"
-    ]
+    def trace_jaxpr(self, dummy_x, dummy_cond):
+        """Extracts and returns the closed JAXPR representation of the forward pass."""
+        closed_jaxpr = jax.make_jaxpr(
+            partial(gpt_forward, self.params, modality_type="audio")
+        )(dummy_x, dummy_cond)
+        return closed_jaxpr
 
-    if len(jaxpr.invars) > 6:
-        raise NotImplementedError("Only up to 6 inputs supported to respect AAPCS64 register limits.")
-
-    literals = {}
-    for eqn in jaxpr.eqns:
-        for invar in eqn.invars:
-            if isinstance(invar, jax.extend.core.Literal):
-                val = float(invar.val)
-                if val not in literals:
-                    literals[val] = None
-
-    free_regs = [f"v{i}.4s" for i in range(8, 32)]
-    
-    for val in literals:
-        if not free_regs:
-            raise RuntimeError("Out of registers for literals.")
-        literals[val] = free_regs.pop(0)
-
-    last_use = {}
-    for i, eqn in enumerate(jaxpr.eqns):
-        for invar in eqn.invars:
-            if not isinstance(invar, jax.extend.core.Literal):
-                last_use[invar] = i
-    for outvar in jaxpr.outvars:
-        last_use[outvar] = len(jaxpr.eqns)
-
-    reg_map = {}
-    spilled_vars = {}
-    stack_ptr = 0
-
-    def alloc_reg(var):
-        nonlocal stack_ptr
-        if not free_regs:
-            if not reg_map:
-                raise RuntimeError("Out of registers and no active variables to spill.")
-            var_to_spill = list(reg_map.keys())[0]
-            reg = reg_map.pop(var_to_spill)
-            stack_ptr += 16
-            asm.append(f"    str {reg.replace('.4s', '').replace('v', 'q')}, [sp, #{stack_ptr}]")
-            spilled_vars[var_to_spill] = stack_ptr
-            free_regs.append(reg)
-        
-        reg = free_regs.pop(0)
-        reg_map[var] = reg
-        return reg
-
-    def free_dead_regs(current_step):
-        for var, reg in list(reg_map.items()):
-            if last_use.get(var, -1) == current_step:
-                free_regs.append(reg)
-                del reg_map[var]
-
-    for val, reg in literals.items():
-        lower_16, upper_16 = float_to_hex_halves(val)
-        asm.append(f"    movz w9, #{lower_16}")
-        if upper_16 != 0:
-            asm.append(f"    movk w9, #{upper_16}, lsl #16")
-        asm.append("    fmov s0, w9")
-        dest_reg = reg.replace(".4s", "")
-        asm.append(f"    dup {dest_reg}.4s, v0.s[0]")
-
-    asm.append("    mov x8, #0")
-    asm.append("    lsl x9, x1, #2")
-    asm.append(".loop_start:")
-    asm.append("    cmp x8, x9")
-    asm.append("    b.ge .loop_end")
-
-    for i, invar in enumerate(jaxpr.invars):
-        reg = alloc_reg(invar)
-        q_reg = reg.replace(".4s", "").replace("v", "q")
-        asm.append(f"    ldr {q_reg}, [x{i + 2}, x8]")
-
-    primitive_map = {"add": "fadd", "sub": "fsub", "mul": "fmul", "div": "fdiv"}
-
-    for step, eqn in enumerate(jaxpr.eqns):
-        prim_name = eqn.primitive.name
-        
-        if prim_name in ["reshape", "broadcast_in_dim", "transpose", "dot_general", "integer_pow"]:
-            if eqn.invars and not isinstance(eqn.invars[0], jax.extend.core.Literal):
-                in_var = eqn.invars[0]
-                if in_var in reg_map and eqn.outvars:
-                    reg_map[eqn.outvars[0]] = reg_map[in_var]
-            free_dead_regs(step)
-            continue
-
-        if prim_name not in primitive_map:
-            free_dead_regs(step)
-            continue
-        
-        input_regs = []
-        for invar in eqn.invars:
-            if isinstance(invar, jax.extend.core.Literal):
-                input_regs.append(literals[float(invar.val)])
-            else:
-                input_regs.append(reg_map.get(invar, "v8.4s"))
-
-        out_reg = alloc_reg(eqn.outvars[0])
-        asm.append(f"    {primitive_map[prim_name]} {out_reg}, {input_regs[0]}, {input_regs[1]}")
-
-        free_dead_regs(step)
-
-    if jaxpr.outvars[0] in reg_map:
-        final_reg = reg_map[jaxpr.outvars[0]]
-        q_final = final_reg.replace(".4s", "").replace("v", "q")
-        asm.append(f"    str {q_final}, [x0, x8]")
-    
-    asm.append("    add x8, x8, #16")
-    asm.append("    b .loop_start")
-    asm.append(".loop_end:")
-    asm.append("    ldp x29, x30, [sp, #96]")
-    asm.append("    add sp, sp, #128")
-    asm.append("    ret")
-
-    return "\n".join(asm)
-
-
-def compile_closed_jaxpr_to_cuda(closed_jaxpr):
-    jaxpr = closed_jaxpr.jaxpr
-    args = ["float* out"]
-    for i in range(len(jaxpr.invars)):
-        args.append(f"const float* in_{i}")
-    args.append("int N")
-        
-    c_lines = [
-        '#include <cuda_runtime.h>',
-        '#include <math.h>',
-        'extern "C" __global__',
-        f"void jax_nvidia_kernel({', '.join(args)}) {{",
-        "    int idx = blockIdx.x * blockDim.x + threadIdx.x;",
-        "    if (idx >= N) return;",
-        ""
-    ]
-
-    var_map = {}
-    var_counter = 0
-
-    def get_cvar(var):
-        nonlocal var_counter
-        if var not in var_map:
-            var_map[var] = f"v{var_counter}"
-            var_counter += 1
-        return var_map[var]
-
-    for i, invar in enumerate(jaxpr.invars):
-        c_lines.append(f"    float {get_cvar(invar)} = in_{i}[idx];")
-    c_lines.append("")
-
-    primitive_map = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
-
-    for eqn in jaxpr.eqns:
-        prim_name = eqn.primitive.name
-        if prim_name in ["reshape", "broadcast_in_dim", "transpose", "dot_general", "integer_pow"]:
-            if eqn.invars and not isinstance(eqn.invars[0], jax.extend.core.Literal) and eqn.outvars:
-                var_map[eqn.outvars[0]] = get_cvar(eqn.invars[0])
-            continue
-
-        if prim_name not in primitive_map:
-            continue
-
-        out_cvar = get_cvar(eqn.outvars[0])
-        op_strs = []
-        for invar in eqn.invars:
-            if isinstance(invar, jax.extend.core.Literal):
-                op_strs.append(f"{float(invar.val)}f")
-            else:
-                op_strs.append(get_cvar(invar))
-                
-        op = primitive_map[prim_name]
-        c_lines.append(f"    float {out_cvar} = {op_strs[0]} {op} {op_strs[1]};")
-
-    if jaxpr.outvars[0] in var_map:
-        out_var = var_map[jaxpr.outvars[0]]
-        c_lines.extend([
-            "",
-            f"    out[idx] = {out_var};",
-            "}",
-            ""
-        ])
-    else:
-        c_lines.extend([
-            "",
-            "    out[idx] = in_0[idx];",
-            "}",
-            ""
-        ])
-
-    wrapper_args = ["float* h_out"]
-    for i in range(len(jaxpr.invars)):
-        wrapper_args.append(f"const float* h_in{i}")
-    wrapper_args.append("int N")
-
-    c_lines.append(f'extern "C" void launch_nvidia_kernel({", ".join(wrapper_args)}) {{')
-    c_lines.append("    float *d_out;")
-    c_lines.append("    cudaMalloc(&d_out, N * sizeof(float));")
-    for i in range(len(jaxpr.invars)):
-        c_lines.append(f"    float *d_in{i};")
-        c_lines.append(f"    cudaMalloc(&d_in{i}, N * sizeof(float));")
-        c_lines.append(f"    cudaMemcpy(d_in{i}, h_in{i}, N * sizeof(float), cudaMemcpyHostToDevice);")
-
-    c_lines.append("")
-    kernel_args = ["d_out"] + [f"d_in{i}" for i in range(len(jaxpr.invars))] + ["N"]
-    c_lines.append("    int threads = 256;")
-    c_lines.append("    int blocks = (N + threads - 1) / threads;")
-    c_lines.append(f"    jax_nvidia_kernel<<<blocks, threads>>>({', '.join(kernel_args)});")
-    c_lines.append("    cudaDeviceSynchronize();")
-    c_lines.append("")
-    c_lines.append("    cudaMemcpy(h_out, d_out, N * sizeof(float), cudaMemcpyDeviceToHost);")
-    c_lines.append("")
-    c_lines.append("    cudaFree(d_out);")
-    for i in range(len(jaxpr.invars)):
-        c_lines.append(f"    cudaFree(d_in{i});")
-    c_lines.append("}")
-
-    return "\n".join(c_lines)
-
-
-class HeterogeneousRuntime:
-    def __init__(self, arm_asm, cuda_code):
-        self.arm_asm = arm_asm
-        self.cuda_code = cuda_code
-        self.lib_arm = None
-        self.lib_cuda = None
-        
-    def compile_and_load(self):
-        with open("kernel.s", "w") as f:
-            f.write(self.arm_asm)
-        with open("kernel.cu", "w") as f:
-            f.write(self.cuda_code)
-            
-        try:
-            link_flags = ["-shared", "-o", "./libarm.so", "kernel.s"]
-            if sys.platform == "darwin":
-                link_flags.extend(["-Wl,-exported_symbol,_jax_arm64_simd_kernel"])
-            else:
-                link_flags.extend(["-Wl,--export-dynamic"])
-
-            subprocess.run(["gcc"] + link_flags, check=True)
-            self.lib_arm = ctypes.CDLL("./libarm.so")
-        except Exception:
-            pass
-
-        try:
-            subprocess.run([
-                "nvcc", "-shared", "-o", "./libnvidia.so", 
-                "-Xcompiler", "-fPIC", "kernel.cu"
-            ], check=True)
-            self.lib_cuda = ctypes.CDLL("./libnvidia.so")
-        except Exception:
-            pass
-
-    def execute_concurrently(self, *inputs):
-        if not inputs:
-            raise ValueError("At least one input tensor is required.")
-        
-        shapes = [x.shape for x in inputs]
-        if len(set(shapes)) > 1:
-            raise ValueError("All input tensors must have the exact same shape.")
-            
-        shape = shapes[0]
-        N = inputs[0].size
-
-        flat_inputs = [np.ascontiguousarray(x.flatten(), dtype=np.float32) for x in inputs]
-
-        padded_N = ((N + 3) // 4) * 4
-        if padded_N != N:
-            padded_inputs = [np.pad(x, (0, padded_N - N), 'constant') for x in flat_inputs]
-            padded_out = np.zeros(padded_N, dtype=np.float32)
-        else:
-            padded_inputs = flat_inputs
-            padded_out = np.zeros(padded_N, dtype=np.float32)
-
-        ptr_padded_inputs = [x.ctypes.data_as(ctypes.c_void_p) for x in padded_inputs]
-        ptr_padded_out = padded_out.ctypes.data_as(ctypes.c_void_p)
-
-        cpu_out_flat = np.zeros(N, dtype=np.float32)
-        gpu_out_flat = np.zeros(N, dtype=np.float32)
-
-        ptr_gpu_inputs = [x.ctypes.data_as(ctypes.c_void_p) for x in flat_inputs]
-        ptr_gpu_out = gpu_out_flat.ctypes.data_as(ctypes.c_void_p)
-
-        used_backends = []
-        start_time = time.time()
-
-        def run_arm():
-            if self.lib_arm and padded_N <= 16384:
-                try:
-                    self.lib_arm.jax_arm64_simd_kernel.argtypes = [ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * len(inputs)
-                    self.lib_arm.jax_arm64_simd_kernel(ptr_padded_out, ctypes.c_int(padded_N), *ptr_padded_inputs)
-                    np.copyto(cpu_out_flat, padded_out[:N])
-                    used_backends.append("ARM64 NEON")
-                except Exception:
-                    pass
-
-        def run_gpu():
-            if self.lib_cuda:
-                try:
-                    self.lib_cuda.launch_nvidia_kernel.argtypes = [ctypes.c_void_p] + [ctypes.c_void_p] * len(inputs) + [ctypes.c_int]
-                    self.lib_cuda.launch_nvidia_kernel(ptr_gpu_out, *ptr_gpu_inputs, ctypes.c_int(N))
-                    used_backends.append("NVIDIA CUDA")
-                except Exception:
-                    pass
-
-        t1 = threading.Thread(target=run_arm)
-        t2 = threading.Thread(target=run_gpu)
-
-        t1.start()
-        t2.start()
-
-        t1.join()
-        t2.join()
-
-        elapsed = time.time() - start_time
-
-        if len(used_backends) == 2:
-            print(f"[Heterogeneous Runtime] Backend Used: Both ARM64 NEON & NVIDIA CUDA Concurrently | Time Elapsed: {elapsed:.4f}s")
-        elif "ARM64 NEON" in used_backends:
-            print(f"[Heterogeneous Runtime] Backend Used: ARM64 NEON Only | Time Elapsed: {elapsed:.4f}s")
-        elif "NVIDIA CUDA" in used_backends:
-            print(f"[Heterogeneous Runtime] Backend Used: NVIDIA CUDA Only | Time Elapsed: {elapsed:.4f}s")
-        else:
-            print(f"[Heterogeneous Runtime] Backend Used: Python/XLA Fallback Only | Time Elapsed: {elapsed:.4f}s")
-
-        return cpu_out_flat.reshape(shape), gpu_out_flat.reshape(shape)
+    def execute(self, noise, cond):
+        """Executes the model inference pass via JAX JIT."""
+        return self.jit_forward(noise, cond)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Multimodal JAX Inference & AOT Compiler Engine")
-    parser.add_argument("--compile", action="store_true", help="Run AOT compilation hooks")
-    parser.add_argument("--generate", action="store_true", help="Run generative sampling")
+    parser = argparse.ArgumentParser(
+        description="Multimodal JAX Inference & JAXPR Inspection Engine with Timing Metrics"
+    )
+    parser.add_argument(
+        "--compile", action="store_true", help="Run JAXPR tracing, inspection, and timing diagnostics"
+    )
+    parser.add_argument(
+        "--generate", action="store_true", help="Run standard production generative sampling with execution timing"
+    )
     parser.add_argument("--seconds", type=int, default=10, help="Duration in seconds")
-    parser.add_argument("--ckpt-mix", type=str, default="checkpoints/checkpoint_bundle.pickle", 
-                        help="Comma-separated list of checkpoint bundles to mix/load")
-    parser.add_argument("--quantization", type=str, default="fp32", choices=["fp32", "fp16", "int8", "int4"],
-                        help="Data quantization tier to simulate during generation/compilation input")
+    parser.add_argument(
+        "--ckpt-mix",
+        type=str,
+        default="checkpoints/checkpoint_bundle.pickle",
+        help="Comma-separated list of checkpoint bundles to mix/load",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="fp32",
+        choices=["fp32", "fp16", "int8", "int4"],
+        help="Data quantization tier to simulate during generation/compilation input",
+    )
     args = parser.parse_args()
 
     ckpt_paths = [p.strip() for p in args.ckpt_mix.split(",")]
     primary_ckpt = ckpt_paths[0]
 
+
     def load_mixed_params():
         if not os.path.exists(primary_ckpt):
             return None
         try:
-            bundle = _load_params_from_bundle(primary_ckpt) if isinstance(_load_params_from_bundle(primary_ckpt), dict) else load_checkpoint_safely()
+            bundle = (
+                _load_params_from_bundle(primary_ckpt)
+                if isinstance(_load_params_from_bundle(primary_ckpt), dict)
+                else load_checkpoint_safely()
+            )
         except Exception:
             bundle = load_checkpoint_safely()
-            
+
         if not bundle:
             return None
-            
-        params = bundle["params"] if isinstance(bundle, dict) and "params" in bundle else bundle
+
+        params = (
+            bundle["params"] if isinstance(bundle, dict) and "params" in bundle else bundle
+        )
         if len(ckpt_paths) > 1:
             print(f"[Inference] Blending checkpoint mix from paths: {ckpt_paths}")
             for alt_path in ckpt_paths[1:]:
                 if os.path.exists(alt_path):
                     alt_p = _load_params_from_bundle(alt_path)
-                    params = jax.tree_util.tree_map(lambda p1, p2: 0.5 * p1 + 0.5 * p2, params, alt_p)
+                    params = jax.tree_util.tree_map(
+                        lambda p1, p2: 0.5 * p1 + 0.5 * p2, params, alt_p
+                    )
         return bundle, params
 
+
     if args.compile:
-        print(f"[AOT Runtime] Initializing model parameters for AOT compilation ({args.seconds}s)...")
+        print(f"[JAX Diagnostics] Initializing model parameters for compilation analysis ({args.seconds}s)...")
         res = load_mixed_params()
         if not res:
-            print("[AOT Runtime] Error: No checkpoint bundle found. Train the model first.")
+            print("[JAX Diagnostics] Error: No checkpoint bundle found. Train the model first.")
             sys.exit(1)
 
         bundle, params = res
@@ -422,24 +123,20 @@ if __name__ == "__main__":
             jnp.zeros((1,), dtype=jnp.float32),
             jnp.zeros((1,), dtype=jnp.int32),
             jnp.zeros((1, args.seconds), dtype=jnp.int32),
-            jnp.zeros((1, args.seconds), dtype=jnp.float32)
+            jnp.zeros((1, args.seconds), dtype=jnp.float32),
         )
 
-        print("[AOT Runtime] Tracing model execution jaxpr with explicit multimodal audio routing...")
-        # Explicitly pass modality_type="audio" matching the updated model.py signature
-        closed_jaxpr = jax.make_jaxpr(partial(gpt_forward, params, modality_type="audio"))(dummy_x, dummy_cond)
-
-        arm_asm = compile_closed_jaxpr_to_arm64(closed_jaxpr)
-        cuda_code = compile_closed_jaxpr_to_cuda(closed_jaxpr)
-
-        runtime = HeterogeneousRuntime(arm_asm, cuda_code)
-        runtime.compile_and_load()
-        print("[AOT Runtime] Heterogeneous runtime compiled successfully.")
+        # Measure JAXPR Tracing Overhead
+        print("[JAX Diagnostics] Tracing model execution jaxpr...")
+        t_trace_start = time.time()
+        engine = JaxprInferenceEngine(params)
+        closed_jaxpr = engine.trace_jaxpr(dummy_x, dummy_cond)
+        t_trace_duration = time.time() - t_trace_start
+        print(f"  -> Tracing Complete | Equations: {len(closed_jaxpr.jaxpr.eqns)} | Time: {t_trace_duration:.4f}s")
 
         key = jax.random.PRNGKey(1337)
         noise = jnp.array(jax.random.normal(key, (1, args.seconds, samples_per_sec)))
-        
-        # Apply quantization tier to test input if requested
+
         if args.quantization != "fp32":
             noise_np = np.array(noise)
             noise_np = apply_quantization_tier([noise_np], args.quantization)[0]
@@ -452,29 +149,34 @@ if __name__ == "__main__":
         sigmas_arr = jnp.ones((1, args.seconds), dtype=jnp.float32)
         cond = (scale, bpm, stem, steps_arr, sigmas_arr)
 
-        print("[AOT Runtime] Executing generation pass via compiled runtime...")
-        start_gen = time.time()
-        cpu_res, gpu_res = runtime.execute_concurrently(noise)
-        print(f"[AOT Runtime] Total generation pass duration: {time.time() - start_gen:.4f}s")
+        # Measure JIT Compilation & Execution Latency
+        print("[JAX Diagnostics] Executing JIT-compiled inference pass (includes XLA compilation warmup)...")
+        t_exec_start = time.time()
+        generated_audio = engine.execute(noise, cond)
+        jax.block_until_ready(generated_audio)
+        t_exec_duration = time.time() - t_exec_start
 
-        generated_audio = gpt_forward(params, noise, cond, modality_type="audio")
+        print(f"\n[Performance Metrics: --compile mode]")
+        print(f"  -> JAXPR Tracing Time    : {t_trace_duration:.4f}s")
+        print(f"  -> JIT Compilation + Run : {t_exec_duration:.4f}s")
+        print(f"  -> Total Diagnostic Time : {t_trace_duration + t_exec_duration:.4f}s")
+
         flat_audio = np.array(generated_audio.reshape(-1), dtype=np.float32)
-        
         flat_audio = np.clip(flat_audio, -1.0, 1.0)
-        output_path = f"output/compiled_generated_{args.seconds}s.wav"
+        output_path = f"output/traced_generated_{args.seconds}s.wav"
         wavfile.write(output_path, samples_per_sec, (flat_audio * 32767).astype(np.int16))
-        print(f"[AOT Runtime] Audio successfully exported to {output_path}")
+        print(f"[JAX Diagnostics] Audio successfully exported to {output_path}")
 
     elif args.generate:
-        print(f"[Generation Engine] Generating {args.seconds} seconds of audio using mixed weights (Quantization: {args.quantization.upper()})...")
+        print(f"[Production Engine] Generating {args.seconds} seconds of audio (Quantization: {args.quantization.upper()})...")
         res = load_mixed_params()
         if not res:
-            print("[Generation Engine] Error: No checkpoint bundle found. Train the model first.")
+            print("[Production Engine] Error: No checkpoint bundle found. Train the model first.")
             sys.exit(1)
 
         bundle, params = res
         os.makedirs("output", exist_ok=True)
-        
+
         samples_per_sec = 44100
         key = jax.random.PRNGKey(1337)
         noise = jnp.array(jax.random.normal(key, (1, args.seconds, samples_per_sec)))
@@ -483,7 +185,7 @@ if __name__ == "__main__":
             noise_np = np.array(noise)
             noise_np = apply_quantization_tier([noise_np], args.quantization)[0]
             noise = jnp.array(noise_np)
-        
+
         scale = jnp.array([64], dtype=jnp.int32)
         bpm = jnp.array([120.0], dtype=jnp.float32)
         stem = jnp.array([0], dtype=jnp.int32)
@@ -491,16 +193,28 @@ if __name__ == "__main__":
         sigmas_arr = jnp.ones((1, args.seconds), dtype=jnp.float32)
         cond = (scale, bpm, stem, steps_arr, sigmas_arr)
 
-        print("[Generation Engine] Running forward generation pass with modality routing...")
-        start_gen = time.time()
-        generated_audio = gpt_forward(params, noise, cond, modality_type="audio")
-        print(f"[Generation Engine] Generation completed in {time.time() - start_gen:.4f}s using standard JAX XLA engine.")
-        
+        t_init_start = time.time()
+        engine = JaxprInferenceEngine(params)
+        t_init_duration = time.time() - t_init_start
+
+        print("[Production Engine] Running pure production generation pass...")
+        t_gen_start = time.time()
+        generated_audio = engine.execute(noise, cond)
+        jax.block_until_ready(generated_audio)
+        t_gen_duration = time.time() - t_gen_start
+
+        print(f"\n[Performance Metrics: --generate mode]")
+        print(f"  -> Engine Init Time      : {t_init_duration:.4f}s (No tracing overhead)")
+        print(f"  -> Pure Execution Time   : {t_gen_duration:.4f}s")
+        print(f"  -> Total Production Time : {t_init_duration + t_gen_duration:.4f}s")
+
         flat_audio = np.array(generated_audio.reshape(-1), dtype=np.float32)
         flat_audio = np.clip(flat_audio, -1.0, 1.0)
         output_path = f"output/generated_{args.seconds}s.wav"
         wavfile.write(output_path, samples_per_sec, (flat_audio * 32767).astype(np.int16))
-        print(f"[Generation Engine] Audio successfully exported to {output_path}")
+        print(f"[Production Engine] Audio successfully exported to {output_path}")
 
     else:
-        print("Usage: python3 inference.py [--compile --seconds <N> | --generate --seconds <N>] [--ckpt-mix <path1,path2>] [--quantization <tier>]")
+        print(
+            "Usage: python3 inference.py [--compile --seconds <N> | --generate --seconds <N>] [--ckpt-mix <path1,path2>] [--quantization <tier>]"
+        )
